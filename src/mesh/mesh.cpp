@@ -40,6 +40,7 @@
 #include "../fft/athena_fft.hpp"
 #include "../fft/turbulence.hpp"
 #include "../field/field.hpp"
+#include "../field/divb_history.hpp"
 #include "../field/field_diffusion/field_diffusion.hpp"
 #include "../globals.hpp"
 #include "../gravity/fft_gravity.hpp"
@@ -336,6 +337,7 @@ Mesh::Mesh(ParameterInput *pin, int mesh_test) :
 
   if (EOS_TABLE_ENABLED) peos_table = new EosTable(pin);
   InitUserMeshData(pin);
+  AddAutomaticHistoryOutputs();
 
   if (multilevel) {
     if (block_size.nx1 % 2 == 1 || (block_size.nx2 % 2 == 1 && f2)
@@ -799,6 +801,7 @@ Mesh::Mesh(ParameterInput *pin, IOWrapper& resfile, int mesh_test) :
 
   if (EOS_TABLE_ENABLED) peos_table = new EosTable(pin);
   InitUserMeshData(pin);
+  AddAutomaticHistoryOutputs();
 
   // read user Mesh data
   IOWrapperSizeT udsize = 0;
@@ -1498,6 +1501,52 @@ void Mesh::AllocateUserHistoryOutput(int n) {
   user_history_func_ = new HistoryOutputFunc[n];
   user_history_ops_ = new UserHistoryOperation[n];
   for (int i=0; i<n; i++) user_history_func_[i] = nullptr;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void Mesh::AddAutomaticHistoryOutputs()
+//! \brief append generic built-in user history diagnostics that should be available to
+//!        all MHD problems without per-pgen enrollment
+
+void Mesh::AddAutomaticHistoryOutputs() {
+  constexpr int ndivb_outputs = MAGNETIC_FIELDS_ENABLED ? 1 : 0;
+  // HO diagnostic counters (HO-calls/HO-fails/hybridized/pure-HO and biortho
+  // histogram bins) used to be enrolled here.  They have been moved to the
+  // separate <problem_id>.efl_debug.csv report (only generated when compiled
+  // with -efl_debug) so .hst stays clean for production analysis.
+  constexpr int nauto_outputs = ndivb_outputs;
+  if (nauto_outputs == 0) return;
+
+  int old_n = nuser_history_output_;
+
+  std::string *old_names = nullptr;
+  HistoryOutputFunc *old_funcs = nullptr;
+  UserHistoryOperation *old_ops = nullptr;
+  if (old_n > 0) {
+    old_names = user_history_output_names_;
+    old_funcs = user_history_func_;
+    old_ops = user_history_ops_;
+  }
+
+  AllocateUserHistoryOutput(old_n + nauto_outputs);
+
+  for (int i = 0; i < old_n; ++i) {
+    user_history_output_names_[i] = old_names[i];
+    user_history_func_[i] = old_funcs[i];
+    user_history_ops_[i] = old_ops[i];
+  }
+
+  if (old_n > 0) {
+    delete [] old_names;
+    delete [] old_funcs;
+    delete [] old_ops;
+  }
+
+  int next = old_n;
+  if (MAGNETIC_FIELDS_ENABLED) {
+    EnrollUserHistoryOutput(next++, DivBMaxAbsHistory, "divB-max",
+                            UserHistoryOperation::max);
+  }
 }
 
 //----------------------------------------------------------------------------------------

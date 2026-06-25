@@ -13,10 +13,13 @@
 
 // C++ headers
 #include <cmath>  // sqrt()
+#include <sstream>   // for stringstream in StencilPrimToLocal* stubs
+#include <stdexcept>
 
 // Athena++ headers
 #include "../athena.hpp"
 #include "../athena_arrays.hpp"
+#include "../defs.hpp"
 #include "../eos/eos.hpp"
 #include "../mesh/mesh.hpp"
 #include "../parameter_input.hpp"
@@ -1808,3 +1811,363 @@ void CalculateTransformation(
   return;
 }
 } // namespace
+
+//----------------------------------------------------------------------------------------
+// Stencil-aware tetrad transform — generic, works for any user-supplied metric.
+// Mirrors PrimToLocal[1|2|3] but loops over a 6-cell stencil at face (k,j,i_face)
+// using the SAME face tetrad for all stencil cells (Antón 2006 §3.4 step (i)).
+//
+// The infrastructure (precomputed metric_face*_kji_ and trans_face*_kji_ arrays)
+// is filled at startup by the user-supplied MetricFunc callback; this function
+// just reads from those caches.  Hydro builds skip B-related work via
+// `#if MAGNETIC_FIELDS_ENABLED` guards (same pattern as kerr-schild.cpp's impl).
+
+void Coordinates::StencilPrimToLocal1(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+  // (a) Hoist face-anchored loop invariants (full 4x4 tetrad — generic metric).
+  // The tetrad is at the face (Antón 2006 equivalence-principle approximation:
+  // face tetrad serves as the common local-Minkowski frame for the stencil).
+  // The METRIC, however, must be evaluated AT THE CELL where utilde lives —
+  // earlier code used face metric here, producing u^µ with u·u ≠ −1.
+  const Real mx_1 = trans_face1_kji_(1, T11, k, j, i_face);
+  const Real mx_2 = 0.0;  // PrimToLocal1 leaves face-1 tetrad with mx_2 = 0 in the
+  const Real mx_3 = 0.0;  // upper triangle; orthonormalization picks face-1 normal.
+  const Real my_1 = trans_face1_kji_(1, T21, k, j, i_face);
+  const Real my_2 = trans_face1_kji_(1, T22, k, j, i_face);
+  const Real my_3 = 0.0;
+  const Real mz_1 = trans_face1_kji_(1, T31, k, j, i_face);
+  const Real mz_2 = trans_face1_kji_(1, T32, k, j, i_face);
+  const Real mz_3 = trans_face1_kji_(1, T33, k, j, i_face);
+#if MAGNETIC_FIELDS_ENABLED
+  const Real mt_0 = trans_face1_kji_(1, T00, k, j, i_face);
+  const Real mx_0 = trans_face1_kji_(1, T10, k, j, i_face);
+  const Real my_0 = trans_face1_kji_(1, T20, k, j, i_face);
+  const Real mz_0 = trans_face1_kji_(1, T30, k, j, i_face);
+#endif
+
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face;
+  (void)bcc;
+  (void)stencil_bbx;
+#endif
+
+  // (b) Loop over 6 stencil cells (i_face-3 .. i_face+2 along x1)
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int ii = i_face + (s - 3);
+
+    const Real rho  = prim(IDN, k, j, ii);
+    const Real pgas = prim(IPR, k, j, ii);
+    const Real uu1  = prim(IVX, k, j, ii);
+    const Real uu2  = prim(IVY, k, j, ii);
+    const Real uu3  = prim(IVZ, k, j, ii);
+
+    // Cell-centered metric at (k, j, ii) — same location as utilde, so γ_E
+    // and u^µ are valid 4-vectors satisfying u·u = −1.
+    const Real g_11 = metric_cell_kji_(0, I11, k, j, ii);
+    const Real g_12 = metric_cell_kji_(0, I12, k, j, ii);
+    const Real g_13 = metric_cell_kji_(0, I13, k, j, ii);
+    const Real g_22 = metric_cell_kji_(0, I22, k, j, ii);
+    const Real g_23 = metric_cell_kji_(0, I23, k, j, ii);
+    const Real g_33 = metric_cell_kji_(0, I33, k, j, ii);
+
+    // Eulerian Lorentz factor (full spatial metric contraction)
+    const Real tmp = g_11*uu1*uu1 + 2.0*g_12*uu1*uu2 + 2.0*g_13*uu1*uu3
+                   + g_22*uu2*uu2 + 2.0*g_23*uu2*uu3
+                   + g_33*uu3*uu3;
+    const Real gamma_E = std::sqrt(1.0 + tmp);
+
+    // Tetrad-frame spatial 4-velocity (linear via storage convention)
+    const Real ut = gamma_E;
+    const Real ux = mx_1*uu1 + mx_2*uu2 + mx_3*uu3;
+    const Real uy = my_1*uu1 + my_2*uu2 + my_3*uu3;
+    const Real uz = mz_1*uu1 + mz_2*uu2 + mz_3*uu3;
+
+    // Direction-1 layout: IVX←tetrad-x, IVY←tetrad-y, IVZ←tetrad-z
+    stencil_prim[s][IDN] = rho;
+    stencil_prim[s][IPR] = pgas;
+    stencil_prim[s][IVX] = ux;
+    stencil_prim[s][IVY] = uy;
+    stencil_prim[s][IVZ] = uz;
+
+#if MAGNETIC_FIELDS_ENABLED
+    const Real bb1 = bn_face;
+    const Real bb2 = bcc(IB2, k, j, ii);
+    const Real bb3 = bcc(IB3, k, j, ii);
+
+    // Inverse metric and lapse at the cell (shift correction in u^i)
+    const Real alpha = std::sqrt(-1.0 / metric_cell_kji_(1, I00, k, j, ii));
+    const Real g01_inv = metric_cell_kji_(1, I01, k, j, ii);
+    const Real g02_inv = metric_cell_kji_(1, I02, k, j, ii);
+    const Real g03_inv = metric_cell_kji_(1, I03, k, j, ii);
+
+    // Recover contravariant 4-velocity (with shift correction — generic, all 3 dirs)
+    const Real u0 = gamma_E / alpha;
+    const Real u1 = uu1 - alpha * gamma_E * g01_inv;
+    const Real u2 = uu2 - alpha * gamma_E * g02_inv;
+    const Real u3 = uu3 - alpha * gamma_E * g03_inv;
+
+    // Lower-index components of cell metric needed for b^µ contraction
+    const Real g_10 = metric_cell_kji_(0, I01, k, j, ii);
+    const Real g_20 = metric_cell_kji_(0, I02, k, j, ii);
+    const Real g_21 = g_12;
+    const Real g_30 = metric_cell_kji_(0, I03, k, j, ii);
+    const Real g_31 = g_13;
+    const Real g_32 = g_23;
+
+    // 4-magnetic field b^μ (generic — full metric contraction)
+    const Real b0 = g_10*bb1*u0 + g_11*bb1*u1 + g_12*bb1*u2 + g_13*bb1*u3
+                  + g_20*bb2*u0 + g_21*bb2*u1 + g_22*bb2*u2 + g_23*bb2*u3
+                  + g_30*bb3*u0 + g_31*bb3*u1 + g_32*bb3*u2 + g_33*bb3*u3;
+    const Real b1 = (bb1 + b0*u1) / u0;
+    const Real b2 = (bb2 + b0*u2) / u0;
+    const Real b3 = (bb3 + b0*u3) / u0;
+
+    // Apply tetrad to 4-magnetic field
+    const Real bt = mt_0 * b0;
+    const Real bx = mx_0*b0 + mx_1*b1 + mx_2*b2 + mx_3*b3;
+    const Real by = my_0*b0 + my_1*b1 + my_2*b2 + my_3*b3;
+    const Real bz = mz_0*b0 + mz_1*b1 + mz_2*b2 + mz_3*b3;
+
+    // Tetrad-frame B^(i) = u^(0) b^(i) - u^(i) b^(0)
+    stencil_prim[s][IBY] = ut*by - uy*bt;
+    stencil_prim[s][IBZ] = ut*bz - uz*bt;
+    stencil_bbx[s] = ut*bx - ux*bt;
+#else
+    (void)ut;
+#endif
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+
+void Coordinates::StencilPrimToLocal2(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+  // Face-2 tetrad — index mapping mirrors PrimToLocal2 exactly. Tetrad coefs
+  // stay at the face; metric below is loaded per-cell inside the loop.
+  const Real mx_1 = 0.0;
+  const Real mx_2 = trans_face2_kji_(1, T11, k, j, i_face);
+  const Real mx_3 = 0.0;
+  const Real my_1 = 0.0;
+  const Real my_2 = trans_face2_kji_(1, T21, k, j, i_face);
+  const Real my_3 = trans_face2_kji_(1, T22, k, j, i_face);
+  const Real mz_1 = trans_face2_kji_(1, T33, k, j, i_face);
+  const Real mz_2 = trans_face2_kji_(1, T31, k, j, i_face);
+  const Real mz_3 = trans_face2_kji_(1, T32, k, j, i_face);
+#if MAGNETIC_FIELDS_ENABLED
+  const Real mt_0 = trans_face2_kji_(1, T00, k, j, i_face);
+  const Real mx_0 = trans_face2_kji_(1, T10, k, j, i_face);
+  const Real my_0 = trans_face2_kji_(1, T20, k, j, i_face);
+  const Real mz_0 = trans_face2_kji_(1, T30, k, j, i_face);
+#endif
+
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face;
+  (void)bcc;
+  (void)stencil_bbx;
+#endif
+
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int jj = j + (s - 3);
+
+    const Real rho  = prim(IDN, k, jj, i_face);
+    const Real pgas = prim(IPR, k, jj, i_face);
+    const Real uu1  = prim(IVX, k, jj, i_face);
+    const Real uu2  = prim(IVY, k, jj, i_face);
+    const Real uu3  = prim(IVZ, k, jj, i_face);
+
+    // Cell-centered metric at (k, jj, i_face) — same location as utilde
+    const Real g_11 = metric_cell_kji_(0, I11, k, jj, i_face);
+    const Real g_12 = metric_cell_kji_(0, I12, k, jj, i_face);
+    const Real g_13 = metric_cell_kji_(0, I13, k, jj, i_face);
+    const Real g_22 = metric_cell_kji_(0, I22, k, jj, i_face);
+    const Real g_23 = metric_cell_kji_(0, I23, k, jj, i_face);
+    const Real g_33 = metric_cell_kji_(0, I33, k, jj, i_face);
+
+    const Real tmp = g_11*uu1*uu1 + 2.0*g_12*uu1*uu2 + 2.0*g_13*uu1*uu3
+                   + g_22*uu2*uu2 + 2.0*g_23*uu2*uu3
+                   + g_33*uu3*uu3;
+    const Real gamma_E = std::sqrt(1.0 + tmp);
+
+    const Real ut = gamma_E;
+    const Real ux = mx_1*uu1 + mx_2*uu2 + mx_3*uu3;
+    const Real uy = my_1*uu1 + my_2*uu2 + my_3*uu3;
+    const Real uz = mz_1*uu1 + mz_2*uu2 + mz_3*uu3;
+
+    // Direction-2 layout: IVY←tetrad-x (face-normal=x2), IVZ←tetrad-y, IVX←tetrad-z
+    stencil_prim[s][IDN] = rho;
+    stencil_prim[s][IPR] = pgas;
+    stencil_prim[s][IVY] = ux;
+    stencil_prim[s][IVZ] = uy;
+    stencil_prim[s][IVX] = uz;
+
+#if MAGNETIC_FIELDS_ENABLED
+    // Direction-2: bn_face=B^2; tang B^3 in IBY of input (we read bcc directly), B^1 in IBZ
+    const Real bb1 = bcc(IB1, k, jj, i_face);
+    const Real bb2 = bn_face;
+    const Real bb3 = bcc(IB3, k, jj, i_face);
+
+    const Real alpha = std::sqrt(-1.0 / metric_cell_kji_(1, I00, k, jj, i_face));
+    const Real g01_inv = metric_cell_kji_(1, I01, k, jj, i_face);
+    const Real g02_inv = metric_cell_kji_(1, I02, k, jj, i_face);
+    const Real g03_inv = metric_cell_kji_(1, I03, k, jj, i_face);
+
+    const Real u0 = gamma_E / alpha;
+    const Real u1 = uu1 - alpha * gamma_E * g01_inv;
+    const Real u2 = uu2 - alpha * gamma_E * g02_inv;
+    const Real u3 = uu3 - alpha * gamma_E * g03_inv;
+
+    const Real g_10 = metric_cell_kji_(0, I01, k, jj, i_face);
+    const Real g_20 = metric_cell_kji_(0, I02, k, jj, i_face);
+    const Real g_21 = g_12;
+    const Real g_30 = metric_cell_kji_(0, I03, k, jj, i_face);
+    const Real g_31 = g_13;
+    const Real g_32 = g_23;
+
+    const Real b0 = g_10*bb1*u0 + g_11*bb1*u1 + g_12*bb1*u2 + g_13*bb1*u3
+                  + g_20*bb2*u0 + g_21*bb2*u1 + g_22*bb2*u2 + g_23*bb2*u3
+                  + g_30*bb3*u0 + g_31*bb3*u1 + g_32*bb3*u2 + g_33*bb3*u3;
+    const Real b1 = (bb1 + b0*u1) / u0;
+    const Real b2 = (bb2 + b0*u2) / u0;
+    const Real b3 = (bb3 + b0*u3) / u0;
+
+    const Real bt = mt_0 * b0;
+    const Real bx = mx_0*b0 + mx_1*b1 + mx_2*b2 + mx_3*b3;
+    const Real by = my_0*b0 + my_1*b1 + my_2*b2 + my_3*b3;
+    const Real bz = mz_0*b0 + mz_1*b1 + mz_2*b2 + mz_3*b3;
+
+    stencil_prim[s][IBY] = ut*by - uy*bt;
+    stencil_prim[s][IBZ] = ut*bz - uz*bt;
+    stencil_bbx[s] = ut*bx - ux*bt;
+#else
+    (void)ut;
+#endif
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+
+void Coordinates::StencilPrimToLocal3(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+  // Face-3 tetrad — index mapping mirrors PrimToLocal3 exactly. Tetrad coefs
+  // stay at the face; metric below is loaded per-cell inside the loop.
+  // (gr_user supports non-axisymmetric metrics, unlike kerr-schild.cpp.)
+  const Real mx_1 = 0.0;
+  const Real mx_2 = 0.0;
+  const Real mx_3 = trans_face3_kji_(1, T11, k, j, i_face);
+  const Real my_1 = trans_face3_kji_(1, T22, k, j, i_face);
+  const Real my_2 = 0.0;
+  const Real my_3 = trans_face3_kji_(1, T21, k, j, i_face);
+  const Real mz_1 = trans_face3_kji_(1, T32, k, j, i_face);
+  const Real mz_2 = trans_face3_kji_(1, T33, k, j, i_face);
+  const Real mz_3 = trans_face3_kji_(1, T31, k, j, i_face);
+#if MAGNETIC_FIELDS_ENABLED
+  const Real mt_0 = trans_face3_kji_(1, T00, k, j, i_face);
+  const Real mx_0 = trans_face3_kji_(1, T10, k, j, i_face);
+  const Real my_0 = trans_face3_kji_(1, T20, k, j, i_face);
+  const Real mz_0 = trans_face3_kji_(1, T30, k, j, i_face);
+#endif
+
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face;
+  (void)bcc;
+  (void)stencil_bbx;
+#endif
+
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int kk = k + (s - 3);
+
+    const Real rho  = prim(IDN, kk, j, i_face);
+    const Real pgas = prim(IPR, kk, j, i_face);
+    const Real uu1  = prim(IVX, kk, j, i_face);
+    const Real uu2  = prim(IVY, kk, j, i_face);
+    const Real uu3  = prim(IVZ, kk, j, i_face);
+
+    // Cell-centered metric at (kk, j, i_face) — same location as utilde
+    const Real g_11 = metric_cell_kji_(0, I11, kk, j, i_face);
+    const Real g_12 = metric_cell_kji_(0, I12, kk, j, i_face);
+    const Real g_13 = metric_cell_kji_(0, I13, kk, j, i_face);
+    const Real g_22 = metric_cell_kji_(0, I22, kk, j, i_face);
+    const Real g_23 = metric_cell_kji_(0, I23, kk, j, i_face);
+    const Real g_33 = metric_cell_kji_(0, I33, kk, j, i_face);
+
+    const Real tmp = g_11*uu1*uu1 + 2.0*g_12*uu1*uu2 + 2.0*g_13*uu1*uu3
+                   + g_22*uu2*uu2 + 2.0*g_23*uu2*uu3
+                   + g_33*uu3*uu3;
+    const Real gamma_E = std::sqrt(1.0 + tmp);
+
+    const Real ut = gamma_E;
+    const Real ux = mx_1*uu1 + mx_2*uu2 + mx_3*uu3;
+    const Real uy = my_1*uu1 + my_2*uu2 + my_3*uu3;
+    const Real uz = mz_1*uu1 + mz_2*uu2 + mz_3*uu3;
+
+    // Direction-3 layout: IVZ←tetrad-x (face-normal=x3), IVX←tetrad-y, IVY←tetrad-z
+    stencil_prim[s][IDN] = rho;
+    stencil_prim[s][IPR] = pgas;
+    stencil_prim[s][IVZ] = ux;
+    stencil_prim[s][IVX] = uy;
+    stencil_prim[s][IVY] = uz;
+
+#if MAGNETIC_FIELDS_ENABLED
+    // Direction-3: bn_face=B^3; tang B^1 in bcc(IB1), B^2 in bcc(IB2)
+    const Real bb1 = bcc(IB1, kk, j, i_face);
+    const Real bb2 = bcc(IB2, kk, j, i_face);
+    const Real bb3 = bn_face;
+
+    const Real alpha = std::sqrt(-1.0 / metric_cell_kji_(1, I00, kk, j, i_face));
+    const Real g01_inv = metric_cell_kji_(1, I01, kk, j, i_face);
+    const Real g02_inv = metric_cell_kji_(1, I02, kk, j, i_face);
+    const Real g03_inv = metric_cell_kji_(1, I03, kk, j, i_face);
+
+    const Real u0 = gamma_E / alpha;
+    const Real u1 = uu1 - alpha * gamma_E * g01_inv;
+    const Real u2 = uu2 - alpha * gamma_E * g02_inv;
+    const Real u3 = uu3 - alpha * gamma_E * g03_inv;
+
+    const Real g_10 = metric_cell_kji_(0, I01, kk, j, i_face);
+    const Real g_20 = metric_cell_kji_(0, I02, kk, j, i_face);
+    const Real g_21 = g_12;
+    const Real g_30 = metric_cell_kji_(0, I03, kk, j, i_face);
+    const Real g_31 = g_13;
+    const Real g_32 = g_23;
+
+    const Real b0 = g_10*bb1*u0 + g_11*bb1*u1 + g_12*bb1*u2 + g_13*bb1*u3
+                  + g_20*bb2*u0 + g_21*bb2*u1 + g_22*bb2*u2 + g_23*bb2*u3
+                  + g_30*bb3*u0 + g_31*bb3*u1 + g_32*bb3*u2 + g_33*bb3*u3;
+    const Real b1 = (bb1 + b0*u1) / u0;
+    const Real b2 = (bb2 + b0*u2) / u0;
+    const Real b3 = (bb3 + b0*u3) / u0;
+
+    const Real bt = mt_0 * b0;
+    const Real bx = mx_0*b0 + mx_1*b1 + mx_2*b2 + mx_3*b3;
+    const Real by = my_0*b0 + my_1*b1 + my_2*b2 + my_3*b3;
+    const Real bz = mz_0*b0 + mz_1*b1 + mz_2*b2 + mz_3*b3;
+
+    stencil_prim[s][IBY] = ut*by - uy*bt;
+    stencil_prim[s][IBZ] = ut*bz - uz*bt;
+    stencil_bbx[s] = ut*bx - ux*bt;
+#else
+    (void)ut;
+#endif
+  }
+  return;
+}

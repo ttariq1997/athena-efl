@@ -181,6 +181,12 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin, bool force_wr
       pdata += pmb->pfield->b.x3f.GetSizeInBytes();
     }
 
+#if EFL_ENABLED
+    // EFL entropy time-history (3 previous snapshots + their times); cannot
+    // be re-derived from current primitives.  See Hydro::EflRestartSize.
+    pdata += pmb->phydro->EflRestartPack(pdata);
+#endif
+
     if (NR_RADIATION_ENABLED || IM_RADIATION_ENABLED) {
       std::memcpy(pdata,pmb->pnrrad->ir.data(),pmb->pnrrad->ir.GetSizeInBytes());
       pdata += pmb->pnrrad->ir.GetSizeInBytes();

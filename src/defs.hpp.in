@@ -24,6 +24,9 @@
 // Riemann solver
 #define RIEMANN_SOLVER "@RSOLVER@"
 
+// configure helper for compile-time branches in CalculateFluxes()
+#define RSOLVER_IS_RUSANOV @RSOLVER_IS_RUSANOV@
+
 // configure.py dict(definitions) Boolean values:
 
 // Equation of state
@@ -51,6 +54,14 @@
 
 // include super-time-stepping? default=0 (false)
 #define STS_ENABLED @STS_ENABLED@
+
+// include entropy-flux-limiter infrastructure? default=0 (false)
+#define EFL_ENABLED @EFL_ENABLED@
+
+// include EFL diagnostic instrumentation (per-cycle CSV report, counters,
+// biorthogonality histogram, LO snapshot arrays)? default=0 (false).
+// Requires EFL_ENABLED.  Compiled-out in production for zero runtime overhead.
+#define EFL_DEBUG @EFL_DEBUG@
 
 // include self gravity? default=0 (false)
 #define SELF_GRAVITY_ENABLED @SELF_GRAVITY_ENABLED@

@@ -7,7 +7,7 @@
 //! \brief piecewise parabolic reconstruction with modified McCorquodale/Colella limiter
 //!        for a Cartesian-like coordinate with uniform spacing, Mignone modified original
 //!        PPM limiter for nonuniform and/or curvilinear coordinate.
-///1
+//!
 //! REFERENCES:
 //! - (CW) P. Colella & P. Woodward, "The Piecewise Parabolic Method (PPM) for Gas-
 //!   Dynamical Simulations", JCP, 54, 174 (1984)
@@ -45,6 +45,26 @@ void Reconstruction::PiecewiseParabolicX1(
     const int k, const int j, const int il, const int iu,
     const AthenaArray<Real> &w, const AthenaArray<Real> &bcc,
     AthenaArray<Real> &wl, AthenaArray<Real> &wr) {
+  if (UsesWenoReconstruction()) {
+    for (int n = 0; n < NHYDRO; ++n) {
+      if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+        ReconstructWeno5X1(w, wl, wr, n, n, k, j, il, iu);
+      } else {
+        ReconstructWeno5ZX1(w, wl, wr, n, n, k, j, il, iu);
+      }
+    }
+#if MAGNETIC_FIELDS_ENABLED
+    if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+      ReconstructWeno5X1(bcc, wl, wr, IBY, IB2, k, j, il, iu);
+      ReconstructWeno5X1(bcc, wl, wr, IBZ, IB3, k, j, il, iu);
+    } else {
+      ReconstructWeno5ZX1(bcc, wl, wr, IBY, IB2, k, j, il, iu);
+      ReconstructWeno5ZX1(bcc, wl, wr, IBZ, IB3, k, j, il, iu);
+    }
+#endif
+    return;
+  }
+
   // CS08 constant used in second derivative limiter, >1 , independent of h
   const Real C2 = 1.25;
 
@@ -223,7 +243,7 @@ void Reconstruction::PiecewiseParabolicX1(
 
     //--- Step 4a. -----------------------------------------------------------------------
     // For uniform Cartesian-like coordinate: apply CS limiters to parabolic interpolant
-    if (uniform[X1DIR]) {
+    if (uniform[X1DIR] && !curvilinear[X1DIR]) {
 #pragma omp simd simdlen(SIMD_WIDTH)
       for (int i=il; i<=iu; ++i) {
         Real qa_tmp = dqf_minus(i)*dqf_plus(i);
@@ -345,6 +365,26 @@ void Reconstruction::PiecewiseParabolicX2(
     const int k, const int j, const int il, const int iu,
     const AthenaArray<Real> &w, const AthenaArray<Real> &bcc,
     AthenaArray<Real> &wl, AthenaArray<Real> &wr) {
+  if (UsesWenoReconstruction()) {
+    for (int n = 0; n < NHYDRO; ++n) {
+      if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+        ReconstructWeno5X2(w, wl, wr, n, n, k, j, il, iu);
+      } else {
+        ReconstructWeno5ZX2(w, wl, wr, n, n, k, j, il, iu);
+      }
+    }
+#if MAGNETIC_FIELDS_ENABLED
+    if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+      ReconstructWeno5X2(bcc, wl, wr, IBY, IB3, k, j, il, iu);
+      ReconstructWeno5X2(bcc, wl, wr, IBZ, IB1, k, j, il, iu);
+    } else {
+      ReconstructWeno5ZX2(bcc, wl, wr, IBY, IB3, k, j, il, iu);
+      ReconstructWeno5ZX2(bcc, wl, wr, IBZ, IB1, k, j, il, iu);
+    }
+#endif
+    return;
+  }
+
   // CS08 constant used in second derivative limiter, >1 , independent of h
   const Real C2 = 1.25;
 
@@ -643,6 +683,26 @@ void Reconstruction::PiecewiseParabolicX3(
     const int k, const int j, const int il, const int iu,
     const AthenaArray<Real> &w, const AthenaArray<Real> &bcc,
     AthenaArray<Real> &wl, AthenaArray<Real> &wr) {
+  if (UsesWenoReconstruction()) {
+    for (int n = 0; n < NHYDRO; ++n) {
+      if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+        ReconstructWeno5X3(w, wl, wr, n, n, k, j, il, iu);
+      } else {
+        ReconstructWeno5ZX3(w, wl, wr, n, n, k, j, il, iu);
+      }
+    }
+#if MAGNETIC_FIELDS_ENABLED
+    if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+      ReconstructWeno5X3(bcc, wl, wr, IBY, IB1, k, j, il, iu);
+      ReconstructWeno5X3(bcc, wl, wr, IBZ, IB2, k, j, il, iu);
+    } else {
+      ReconstructWeno5ZX3(bcc, wl, wr, IBY, IB1, k, j, il, iu);
+      ReconstructWeno5ZX3(bcc, wl, wr, IBZ, IB2, k, j, il, iu);
+    }
+#endif
+    return;
+  }
+
   // CS08 constant used in second derivative limiter, >1 , independent of h
   const Real C2 = 1.25;
 

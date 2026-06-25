@@ -69,10 +69,18 @@ void Hydro::RiemannSolver(const int k, const int j, const int il, const int iu,
                     g_, gi_, prim_l, prim_r, cons_, flux,
                     ey, ez);
   }
-  for(int i=il; i<=iu; ++i) {
-    wct(k,j,i) = GetWeightForCT(flux(IDN,k,j,i), prim_l(IDN,i), prim_r(IDN,i), dxw(i),
-                                dt);
+#if EFL_ENABLED
+  // In EFL mode CombineFluxesDir recomputes wct from the blended IDN flux
+  // ([calculate_fluxes.cpp] ~L106), so computing it here would be overwritten.
+  if (!efl_enabled) {
+#endif
+    for(int i=il; i<=iu; ++i) {
+      wct(k,j,i) = GetWeightForCT(flux(IDN,k,j,i), prim_l(IDN,i), prim_r(IDN,i),
+                                  dxw(i), dt);
+    }
+#if EFL_ENABLED
   }
+#endif
   return;
 }
 

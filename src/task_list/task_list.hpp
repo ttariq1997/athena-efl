@@ -149,6 +149,10 @@ class TimeIntegratorTaskList : public TaskList {
 
   TaskStatus CalculateHydroFlux(MeshBlock *pmb, int stage);
   TaskStatus CalculateEMF(MeshBlock *pmb, int stage);
+#if EFL_ENABLED
+  TaskStatus CalculateEFL(MeshBlock *pmb, int stage);
+  TaskStatus SetEntropyHistory(MeshBlock *pmb, int stage);
+#endif
 
   TaskStatus SendHydroFlux(MeshBlock *pmb, int stage);
   TaskStatus SendEMF(MeshBlock *pmb, int stage);
@@ -386,6 +390,8 @@ const TaskID SEND_RADSH(72);
 const TaskID RECV_RADSH(73);
 
 const TaskID SRCTERM_IMRAD(74);
+const TaskID CALC_EFL(75);
+const TaskID SET_ENTROPY_HIST(76);
 
 }  // namespace HydroIntegratorTaskNames
 #endif  // TASK_LIST_TASK_LIST_HPP_

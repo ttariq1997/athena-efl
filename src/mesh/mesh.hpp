@@ -379,6 +379,7 @@ class Mesh {
 
   void CorrectMidpointInitialCondition();
   void ReserveMeshBlockPhysIDs();
+  void AddAutomaticHistoryOutputs();
 
   // Mesh::LoadBalancingAndAdaptiveMeshRefinement() helper functions:
   void UpdateCostList();

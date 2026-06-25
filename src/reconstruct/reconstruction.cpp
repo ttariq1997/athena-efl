@@ -74,6 +74,12 @@ Reconstruction::Reconstruction(MeshBlock *pmb, ParameterInput *pin) :
           << "4th-order constrained transport algorithm is not yet merged" << std::endl;
       ATHENA_ERROR(msg);
     }
+  } else if (input_recon == "weno5") {
+    xorder = 3;
+    primitive_recon_variant = PrimitiveReconVariant::weno5;
+  } else if (input_recon == "weno5z") {
+    xorder = 3;
+    primitive_recon_variant = PrimitiveReconVariant::weno5z;
   } else {
     std::stringstream msg;
     msg << "### FATAL ERROR in Reconstruction constructor" << std::endl

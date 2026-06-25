@@ -47,6 +47,18 @@ void Reconstruction::PiecewiseParabolicX1(
     const int k, const int j, const int il, const int iu,
     const AthenaArray<Real> &q,
     AthenaArray<Real> &ql, AthenaArray<Real> &qr) {
+  if (UsesWenoReconstruction()) {
+    const int nu = q.GetDim4() - 1;
+    for (int n = 0; n <= nu; ++n) {
+      if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+        ReconstructWeno5X1(q, ql, qr, n, n, k, j, il, iu);
+      } else {
+        ReconstructWeno5ZX1(q, ql, qr, n, n, k, j, il, iu);
+      }
+    }
+    return;
+  }
+
   const int nu = q.GetDim4() - 1;
 
   // CS08 constant used in second derivative limiter, >1 , independent of h
@@ -563,6 +575,18 @@ void Reconstruction::PiecewiseParabolicX2(
     const int k, const int j, const int il, const int iu,
     const AthenaArray<Real> &q,
     AthenaArray<Real> &ql, AthenaArray<Real> &qr) {
+  if (UsesWenoReconstruction()) {
+    const int nu = q.GetDim4() - 1;
+    for (int n = 0; n <= nu; ++n) {
+      if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+        ReconstructWeno5X2(q, ql, qr, n, n, k, j, il, iu);
+      } else {
+        ReconstructWeno5ZX2(q, ql, qr, n, n, k, j, il, iu);
+      }
+    }
+    return;
+  }
+
   const int nu = q.GetDim4() - 1;
   // CS08 constant used in second derivative limiter, >1 , independent of h
   const Real C2 = 1.25;
@@ -1073,6 +1097,18 @@ void Reconstruction::PiecewiseParabolicX3(
     const int k, const int j, const int il, const int iu,
     const AthenaArray<Real> &q,
     AthenaArray<Real> &ql, AthenaArray<Real> &qr) {
+  if (UsesWenoReconstruction()) {
+    const int nu = q.GetDim4() - 1;
+    for (int n = 0; n <= nu; ++n) {
+      if (primitive_recon_variant == PrimitiveReconVariant::weno5) {
+        ReconstructWeno5X3(q, ql, qr, n, n, k, j, il, iu);
+      } else {
+        ReconstructWeno5ZX3(q, ql, qr, n, n, k, j, il, iu);
+      }
+    }
+    return;
+  }
+
   const int nu = q.GetDim4() - 1;
   // CS08 constant used in second derivative limiter, >1 , independent of h
   const Real C2 = 1.25;

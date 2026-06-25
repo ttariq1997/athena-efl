@@ -106,7 +106,8 @@ parser.add_argument('--eos',
 # --flux=[name] argument
 parser.add_argument('--flux',
                     default='default',
-                    choices=['default', 'hlle', 'hllc', 'lhllc', 'hlld', 'lhlld', 'roe', 'llf'], # noqa
+                    choices=['default', 'hlle', 'hllc', 'lhllc', 'hlld', 'lhlld',
+                             'roe', 'llf', 'rusanov'], # noqa
                     help='select Riemann solver')
 
 # --nghost=[value] argument
@@ -135,6 +136,20 @@ parser.add_argument('-sts',
                     action='store_true',
                     default=False,
                     help='enable super-time-stepping')
+
+# -efl argument
+parser.add_argument('-efl',
+                    action='store_true',
+                    default=False,
+                    help='enable SR-only entropy-flux-limiter infrastructure')
+
+# -efl_debug argument
+parser.add_argument('-efl_debug',
+                    action='store_true',
+                    default=False,
+                    help='enable EFL diagnostic instrumentation (per-cycle CSV report, '
+                         'counters, biorthogonality histogram, LO snapshot arrays). '
+                         'Compiled-out in production. Requires -efl.')
 
 # -s argument
 parser.add_argument('-s',
@@ -387,6 +402,27 @@ if args['flux'] == 'lhlld' and args['eos'] == 'isothermal':
     raise SystemExit('### CONFIGURE ERROR: LHLLD flux cannot be used with isothermal EOS') # noqa
 if args['flux'] == 'lhlld' and not args['b']:
     raise SystemExit('### CONFIGURE ERROR: LHLLD flux can only be used with MHD')
+if args['flux'] == 'rusanov' and not (args['s'] or args['g']):
+    raise SystemExit('### CONFIGURE ERROR: Rusanov flux requires relativity '
+                     '(use -s for SR or -g for GR).')
+if args['efl'] and not args['s'] and not args['g']:
+    pass  # explicit error already exists below
+if args['efl'] and not args['s'] and not args['g']:
+    raise SystemExit('### CONFIGURE ERROR: EFL requires relativity (-s or -g)')
+# EFL is now supported for both SR hydro and SR/GR MHD.  The HO Rusanov source
+# is selected based on -b in the EFL_RSOLVER_FILE block below.
+if args['efl'] and not args['s'] and not args['g']:
+    raise SystemExit('### CONFIGURE ERROR: EFL requires relativity (-s or -g)')
+# GR + EFL is supported (GRMHD high-order via equivalence principle)
+# Non-cartesian coordinates with EFL require GR
+if args['efl'] and args['coord'] != 'cartesian' and not args['g']:
+    raise SystemExit('### CONFIGURE ERROR: EFL with non-cartesian coordinates requires GR (-g)')
+if args['efl'] and args['flux'] == 'rusanov':
+    raise SystemExit('### CONFIGURE ERROR: EFL requires a low-order base solver; do not use --flux=rusanov')
+if args['efl'] and args['sts']:
+    raise SystemExit('### CONFIGURE ERROR: EFL is currently incompatible with STS')
+if args['efl'] and int(args['nghost']) < 4:
+    raise SystemExit('### CONFIGURE ERROR: EFL requires --nghost >= 4')
 
 # Check relativity
 if args['s'] and args['g']:
@@ -394,7 +430,7 @@ if args['s'] and args['g']:
                      + 'GR implies SR; the -s option is restricted to pure SR')
 if args['t'] and not args['g']:
     raise SystemExit('### CONFIGURE ERROR: Frame transformations only apply to GR')
-if args['g'] and not args['t'] and args['flux'] not in ('llf', 'hlle'):
+if args['g'] and not args['t'] and args['flux'] not in ('llf', 'hlle', 'rusanov'):
     raise SystemExit('### CONFIGURE ERROR: Frame transformations required for {0}'
                      .format(args['flux']))
 if args['g'] and args['coord'] in ('cartesian', 'cylindrical', 'spherical_polar'):
@@ -446,6 +482,7 @@ if args['nr_radiation'] and args['implicit_radiation']:
 definitions = {}
 makefile_options = {}
 makefile_options['LOADER_FLAGS'] = ''
+makefile_options['EFL_RSOLVER_FILE'] = ''
 
 # --prob=[name] argument
 definitions['PROBLEM'] = makefile_options['PROBLEM_FILE'] = args['prob']
@@ -474,6 +511,7 @@ else:
 
 # --flux=[name] argument
 definitions['RSOLVER'] = makefile_options['RSOLVER_FILE'] = args['flux']
+definitions['RSOLVER_IS_RUSANOV'] = '1' if args['flux'] == 'rusanov' else '0'
 
 # --nghost=[value] argument
 definitions['NUMBER_GHOST_CELLS'] = args['nghost']
@@ -494,7 +532,7 @@ if args['b']:
         makefile_options['EOS_FILE'] += '_mhd'
     definitions['NFIELD_VARIABLES'] = '3'
     makefile_options['RSOLVER_DIR'] = 'mhd/'
-    if args['flux'] == 'hlle' or args['flux'] == 'llf' or args['flux'] == 'roe':
+    if args['flux'] in ('hlle', 'llf', 'roe', 'rusanov'):
         makefile_options['RSOLVER_FILE'] += '_mhd'
     if args['eos'] == 'isothermal':
         definitions['NWAVE_VALUE'] = '6'
@@ -521,6 +559,28 @@ if args['sts']:
 else:
     definitions['STS_ENABLED'] = '0'
 
+# -efl argument
+# When -efl is enabled, we additionally compile the HO Rusanov driver source
+# (the LO base solver is selected by --flux).  Choose the SRMHD vs SRHD HO
+# source based on -b.  In the no-EFL --flux=rusanov path the HO source is
+# picked up automatically via RSOLVER_FILE (rusanov_mhd_rel.cpp under mhd/, or
+# rusanov_rel.cpp under hydro/), so we leave EFL_RSOLVER_FILE empty there.
+if args['efl']:
+    definitions['EFL_ENABLED'] = '1'
+    if args['b']:
+        makefile_options['EFL_RSOLVER_FILE'] = (
+            'src/hydro/rsolvers/mhd/rusanov_mhd_rel.cpp')
+    else:
+        makefile_options['EFL_RSOLVER_FILE'] = (
+            'src/hydro/rsolvers/hydro/rusanov_rel.cpp')
+else:
+    definitions['EFL_ENABLED'] = '0'
+
+# -efl_debug argument: diagnostic instrumentation, only meaningful with -efl.
+if args['efl_debug'] and not args['efl']:
+    raise SystemExit('### CONFIGURE ERROR: -efl_debug requires -efl')
+definitions['EFL_DEBUG'] = '1' if args['efl_debug'] else '0'
+
 # -s, -g, and -t arguments
 definitions['RELATIVISTIC_DYNAMICS'] = '1' if args['s'] or args['g'] else '0'
 definitions['GENERAL_RELATIVITY'] = '1' if args['g'] else '0'
@@ -534,7 +594,10 @@ if args['g']:
     if definitions['GENERAL_EOS'] != '0':
         makefile_options['GENERAL_EOS_FILE'] += '_gr'
     makefile_options['RSOLVER_FILE'] += '_rel'
-    if not args['t']:
+    # Rusanov HO driver extracts the metric directly at faces and does not use
+    # the PrimToLocal/FluxToGlobal frame transformations, so the _no_transform
+    # variant does not apply.
+    if not args['t'] and args['flux'] != 'rusanov':
         makefile_options['RSOLVER_FILE'] += '_no_transform'
 
 
@@ -1015,6 +1078,7 @@ output_config('Cosmic Ray Diffusion', ('ON' if args['crdiff'] else 'OFF'), flog)
 output_config('Frame transformations', ('ON' if args['t'] else 'OFF'), flog)
 output_config('Self-Gravity', self_grav_string, flog)
 output_config('Super-Time-Stepping', ('ON' if args['sts'] else 'OFF'), flog)
+output_config('Entropy-Flux Limiter (EFL)', ('ON' if args['efl'] else 'OFF'), flog)
 output_config('Chemistry', (args['chemistry']
                             if args['chemistry'] is not None else 'OFF'), flog)
 output_config('KIDA rates', (args['kida_rates']

@@ -1874,3 +1874,365 @@ void Coordinates::LowerVectorCell(Real a0, Real a1, Real a2, Real a3, int k, int
   *pa_3 = g_30*a0 + g_31*a1 + g_32*a2 + g_33*a3;
   return;
 }
+
+//----------------------------------------------------------------------------------------
+// Stencil-aware tetrad transform for HO GRMHD pipeline
+// Antón 2006 §3.4 step (i): transform a 6-cell stencil into local Minkowski
+// frame at face (k,j,i_face). Replaces 6× separate PrimToLocal calls
+// (with L==R duplication and (NWAVE, ncells1) scratch arrays) with a single
+// pass that reuses the face tetrad coefficients and metric components.
+//
+// Each implementation mirrors the math of the corresponding PrimToLocal[1|2|3]:
+//   - Recover Eulerian Lorentz factor γ_E and contravariant 4-velocity u^μ
+//     (with shift correction u^1 = ũ^1 - α γ_E g^{01})
+//   - Compute 4-magnetic field b^μ from (u, B)
+//   - Apply face tetrad to (u, b) → tetrad-frame quantities
+//   - Output tetrad-frame velocity components (direction-permuted), tang B,
+//     and face-normal B^(x) per cell
+//
+// The output `stencil_prim[s][...]` and `stencil_bbx[s]` arrays follow the same
+// layout that PrimToLocal[1|2|3] produces in its scratch arrays — see the
+// header comments in the corresponding PrimToLocal[1|2|3] above for slot
+// permutation details.
+//----------------------------------------------------------------------------------------
+
+void Coordinates::StencilPrimToLocal1(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+  // (a) Cell metric covering the full 6-cell stencil [i_face-3 .. i_face+2].
+  // utilde at cell ii must be converted to a 4-vector using g_µν(ii); using the
+  // face metric (as before) gave u^µ that did not satisfy u·u=−1.
+  CellMetric(k, j, i_face - 3, i_face + 2, g_, gi_);
+
+  // (b) Hoist face-anchored loop invariants — the tetrad IS anchored at the
+  // face by construction (Antón 2006 equivalence-principle approximation).
+  const Real mt_0 = trans_face1_ji1_(j, i_face);
+  const Real mx_0 = trans_face1_ji5_(j, i_face);
+  const Real mx_1 = trans_face1_ji2_(j, i_face);
+  const Real my_2 = trans_face1_ji3_(j, i_face);
+  const Real mz_0 = trans_face1_ji6_(j, i_face);
+  const Real mz_1 = trans_face1_ji7_(j, i_face);
+  const Real mz_3 = trans_face1_ji4_(j, i_face);
+
+  // bn_face / bcc are unused in pure-hydro builds; suppress -Wunused-parameter.
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face;
+  (void)bcc;
+  (void)stencil_bbx;
+#endif
+
+  // (c) Loop over 6 stencil cells (i_face-3 .. i_face+2 along x1)
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int ii = i_face + (s - 3);
+
+    // Read lab-frame primitives for cell (k, j, ii)
+    const Real rho  = prim(IDN, k, j, ii);
+    const Real pgas = prim(IPR, k, j, ii);
+    const Real uu1  = prim(IVX, k, j, ii);
+    const Real uu2  = prim(IVY, k, j, ii);
+    const Real uu3  = prim(IVZ, k, j, ii);
+
+    // Metric at the cell — same location as utilde, so γ_E and u^µ are
+    // valid 4-vectors satisfying u·u = −1 at the cell.
+    const Real g_11 = g_(I11, ii);
+    const Real g_13 = g_(I13, ii);
+    const Real g_22 = g_(I22, ii);
+    const Real g_33 = g_(I33, ii);
+
+    // Recover γ_E and contravariant u^μ (with shift correction)
+    const Real tmp = g_11*uu1*uu1 + 2.0*g_13*uu1*uu3
+                   + g_22*uu2*uu2 + g_33*uu3*uu3;
+    const Real gamma_E = std::sqrt(1.0 + tmp);
+
+    // Apply tetrad to spatial 4-velocity (linear via storage convention)
+    const Real ut = gamma_E;
+    const Real ux = mx_1 * uu1;
+    const Real uy = my_2 * uu2;
+    const Real uz = mz_1*uu1 + mz_3*uu3;
+
+    // Write velocity + scalar primitives (always)
+    stencil_prim[s][IDN] = rho;
+    stencil_prim[s][IPR] = pgas;
+    stencil_prim[s][IVX] = ux;
+    stencil_prim[s][IVY] = uy;
+    stencil_prim[s][IVZ] = uz;
+
+#if MAGNETIC_FIELDS_ENABLED
+    // Face-compatible: shared face-normal B; tangential from cell-centered bcc
+    const Real bb1 = bn_face;
+    const Real bb2 = bcc(IB2, k, j, ii);
+    const Real bb3 = bcc(IB3, k, j, ii);
+
+    const Real alpha = std::sqrt(-1.0 / gi_(I00, ii));
+    const Real g01_inv = gi_(I01, ii);
+    const Real u0 = gamma_E / alpha;
+    const Real u1 = uu1 - alpha * gamma_E * g01_inv;
+    const Real u2 = uu2;
+    const Real u3 = uu3;
+
+    // 4-magnetic field b^μ (KS: g_02 = g_12 = g_23 = 0)
+    const Real g_10 = g_(I01, ii);
+    const Real g_30 = g_(I03, ii);
+    const Real g_31 = g_(I13, ii);
+    const Real b0 = g_10*bb1*u0 + g_11*bb1*u1 + g_13*bb1*u3 + g_22*bb2*u2
+                  + g_30*bb3*u0 + g_31*bb3*u1 + g_33*bb3*u3;
+    const Real b1 = (bb1 + b0*u1) / u0;
+    const Real b2 = (bb2 + b0*u2) / u0;
+    const Real b3 = (bb3 + b0*u3) / u0;
+
+    // Apply tetrad to 4-magnetic field
+    const Real bt = mt_0 * b0;
+    const Real bx = mx_0*b0 + mx_1*b1;
+    const Real by = my_2 * b2;
+    const Real bz = mz_0*b0 + mz_1*b1 + mz_3*b3;
+
+    // Tetrad-frame B^(i) = u^(0) b^(i) - u^(i) b^(0)
+    const Real bbx_local = ut*bx - ux*bt;
+    const Real bby_local = ut*by - uy*bt;
+    const Real bbz_local = ut*bz - uz*bt;
+
+    stencil_prim[s][IBY] = bby_local;
+    stencil_prim[s][IBZ] = bbz_local;
+    stencil_bbx[s] = bbx_local;
+#else
+    // Suppress unused-warnings for tetrad components used only in MHD branch
+    (void)mt_0; (void)mx_0; (void)mz_0;
+    (void)ut;
+#endif
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+
+void Coordinates::StencilPrimToLocal2(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+  // The x2-stencil runs over jj = j-3..j+2 at fixed (k, i_face). The metric
+  // depends on (j, i) — for the cell at jj, we need g(k, jj, i_face). The
+  // existing CellMetric helper iterates over i, so we call it once per jj
+  // inside the loop (small overhead vs. allocating a (6, NMETRIC) buffer).
+  // Tetrad coefficients stay at the face — Antón 2006 equivalence principle.
+
+  // Hoist face-anchored loop invariants (face-2 tetrad coefs)
+  const Real mx_2 = trans_face2_ji3_(j, i_face);
+  const Real my_3 = trans_face2_ji4_(j, i_face);
+  const Real mz_1 = trans_face2_ji2_(j, i_face);
+  const Real mz_3 = trans_face2_ji6_(j, i_face);
+#if MAGNETIC_FIELDS_ENABLED
+  const Real mt_0 = trans_face2_ji1_(j, i_face);
+  const Real mz_0 = trans_face2_ji5_(j, i_face);
+#endif
+
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face;
+  (void)bcc;
+  (void)stencil_bbx;
+#endif
+
+  // Loop over 6 stencil cells along x2 axis (jj = j - 3 .. j + 2). We do NOT
+  // omp-simd this loop because each iteration calls CellMetric (which writes
+  // into shared scratch g_, gi_); vectorizing inside CellMetric is fine.
+  for (int s = 0; s < 6; ++s) {
+    const int jj = j + (s - 3);
+
+    // Read lab-frame primitives for cell (k, jj, i_face)
+    const Real rho  = prim(IDN, k, jj, i_face);
+    const Real pgas = prim(IPR, k, jj, i_face);
+    const Real uu1  = prim(IVX, k, jj, i_face);
+    const Real uu2  = prim(IVY, k, jj, i_face);
+    const Real uu3  = prim(IVZ, k, jj, i_face);
+
+    // Cell metric at (k, jj, i_face) — matches utilde location
+    CellMetric(k, jj, i_face, i_face, g_, gi_);
+    const Real g_11 = g_(I11, i_face);
+    const Real g_13 = g_(I13, i_face);
+    const Real g_22 = g_(I22, i_face);
+    const Real g_33 = g_(I33, i_face);
+
+    // Recover γ_E
+    const Real tmp = g_11*uu1*uu1 + 2.0*g_13*uu1*uu3
+                   + g_22*uu2*uu2 + g_33*uu3*uu3;
+    const Real gamma_E = std::sqrt(1.0 + tmp);
+
+    // Apply tetrad to spatial 4-velocity
+    const Real ut = gamma_E;
+    const Real ux = mx_2 * uu2;
+    const Real uy = my_3 * uu3;
+    const Real uz = mz_1*uu1 + mz_3*uu3;
+
+    // Direction-2 layout: IVY←tetrad-x (face-normal), IVZ←tetrad-y, IVX←tetrad-z
+    stencil_prim[s][IDN] = rho;
+    stencil_prim[s][IPR] = pgas;
+    stencil_prim[s][IVY] = ux;
+    stencil_prim[s][IVZ] = uy;
+    stencil_prim[s][IVX] = uz;
+
+#if MAGNETIC_FIELDS_ENABLED
+    // Face-compatible: bn_face=B^2; tang B^3 from bcc(IB3); B^1 from bcc(IB1)
+    const Real bb1 = bcc(IB1, k, jj, i_face);
+    const Real bb2 = bn_face;
+    const Real bb3 = bcc(IB3, k, jj, i_face);
+
+    const Real alpha = std::sqrt(-1.0 / gi_(I00, i_face));
+    const Real g01_inv = gi_(I01, i_face);
+    const Real u0 = gamma_E / alpha;
+    const Real u1 = uu1 - alpha * gamma_E * g01_inv;
+    const Real u2 = uu2;
+    const Real u3 = uu3;
+
+    // 4-magnetic field b^μ (KS: g_02 = g_12 = g_23 = 0)
+    const Real g_10 = g_(I01, i_face);
+    const Real g_30 = g_(I03, i_face);
+    const Real g_31 = g_(I13, i_face);
+    const Real b0 = g_10*bb1*u0 + g_11*bb1*u1 + g_13*bb1*u3 + g_22*bb2*u2
+                  + g_30*bb3*u0 + g_31*bb3*u1 + g_33*bb3*u3;
+    const Real b1 = (bb1 + b0*u1) / u0;
+    const Real b2 = (bb2 + b0*u2) / u0;
+    const Real b3 = (bb3 + b0*u3) / u0;
+
+    // Apply tetrad to 4-magnetic field
+    const Real bt = mt_0 * b0;
+    const Real bx = mx_2 * b2;
+    const Real by = my_3 * b3;
+    const Real bz = mz_0*b0 + mz_1*b1 + mz_3*b3;
+
+    // Tetrad-frame B^(i) = u^(0) b^(i) - u^(i) b^(0)
+    const Real bbx_local = ut*bx - ux*bt;
+    const Real bby_local = ut*by - uy*bt;
+    const Real bbz_local = ut*bz - uz*bt;
+
+    stencil_prim[s][IBY] = bby_local;
+    stencil_prim[s][IBZ] = bbz_local;
+    stencil_bbx[s] = bbx_local;
+#else
+    (void)ut;
+#endif
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+
+void Coordinates::StencilPrimToLocal3(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+  // KS is axisymmetric: metric is independent of φ (the x3 coordinate).
+  // For the x3 stencil running over kk = k-3..k+2 at fixed (j, i_face), the
+  // cell metric at (kk, j, i_face) equals the face metric at (k, j, i_face)
+  // exactly — Face3Metric and CellMetric give the same values when iterated
+  // over k. So unlike directions 1 and 2, this routine has no face-vs-cell
+  // mismatch to fix. We use CellMetric for code-style consistency with the
+  // other two directions; mathematically equivalent.
+  CellMetric(k, j, i_face, i_face, g_, gi_);
+
+  // Hoist face-anchored loop invariants (face-3 tetrad coefs)
+  const Real mx_3 = trans_face3_ji4_(j, i_face);
+  const Real my_1 = trans_face3_ji2_(j, i_face);
+  const Real my_3 = trans_face3_ji6_(j, i_face);
+  const Real mz_2 = trans_face3_ji3_(j, i_face);
+#if MAGNETIC_FIELDS_ENABLED
+  const Real mt_0 = trans_face3_ji1_(j, i_face);
+  const Real my_0 = trans_face3_ji5_(j, i_face);
+#endif
+
+  // Metric components — same for every stencil cell because KS is φ-independent.
+  const Real g_11 = g_(I11, i_face);
+  const Real g_13 = g_(I13, i_face);
+  const Real g_22 = g_(I22, i_face);
+  const Real g_33 = g_(I33, i_face);
+  const Real g01_inv = gi_(I01, i_face);
+  const Real alpha = std::sqrt(-1.0 / gi_(I00, i_face));
+#if MAGNETIC_FIELDS_ENABLED
+  const Real g_10 = g_(I01, i_face);
+  const Real g_30 = g_(I03, i_face);
+  const Real g_31 = g_(I13, i_face);
+#endif
+
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face;
+  (void)bcc;
+  (void)stencil_bbx;
+#endif
+
+  // Loop over 6 stencil cells along x3 axis (kk = k - 3 .. k + 2)
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int kk = k + (s - 3);
+
+    // Read lab-frame primitives for cell (kk, j, i_face)
+    const Real rho  = prim(IDN, kk, j, i_face);
+    const Real pgas = prim(IPR, kk, j, i_face);
+    const Real uu1  = prim(IVX, kk, j, i_face);
+    const Real uu2  = prim(IVY, kk, j, i_face);
+    const Real uu3  = prim(IVZ, kk, j, i_face);
+
+    // Recover γ_E
+    const Real tmp = g_11*uu1*uu1 + 2.0*g_13*uu1*uu3
+                   + g_22*uu2*uu2 + g_33*uu3*uu3;
+    const Real gamma_E = std::sqrt(1.0 + tmp);
+
+    // Apply tetrad to spatial 4-velocity
+    const Real ut = gamma_E;
+    const Real ux = mx_3 * uu3;
+    const Real uy = my_1*uu1 + my_3*uu3;
+    const Real uz = mz_2 * uu2;
+
+    // Direction-3 layout: IVZ←tetrad-x (face-normal), IVX←tetrad-y, IVY←tetrad-z
+    stencil_prim[s][IDN] = rho;
+    stencil_prim[s][IPR] = pgas;
+    stencil_prim[s][IVZ] = ux;
+    stencil_prim[s][IVX] = uy;
+    stencil_prim[s][IVY] = uz;
+
+#if MAGNETIC_FIELDS_ENABLED
+    // Face-compatible: bn_face=B^3; tang B^1 from bcc(IB1); B^2 from bcc(IB2)
+    const Real bb1 = bcc(IB1, kk, j, i_face);
+    const Real bb2 = bcc(IB2, kk, j, i_face);
+    const Real bb3 = bn_face;
+
+    const Real u0 = gamma_E / alpha;
+    const Real u1 = uu1 - alpha * gamma_E * g01_inv;
+    const Real u2 = uu2;
+    const Real u3 = uu3;
+
+    // 4-magnetic field b^μ
+    const Real b0 = g_10*bb1*u0 + g_11*bb1*u1 + g_13*bb1*u3 + g_22*bb2*u2
+                  + g_30*bb3*u0 + g_31*bb3*u1 + g_33*bb3*u3;
+    const Real b1 = (bb1 + b0*u1) / u0;
+    const Real b2 = (bb2 + b0*u2) / u0;
+    const Real b3 = (bb3 + b0*u3) / u0;
+
+    // Apply tetrad to 4-magnetic field
+    const Real bt = mt_0 * b0;
+    const Real bx = mx_3 * b3;
+    const Real by = my_0*b0 + my_1*b1 + my_3*b3;
+    const Real bz = mz_2 * b2;
+
+    // Tetrad-frame B^(i) = u^(0) b^(i) - u^(i) b^(0)
+    const Real bbx_local = ut*bx - ux*bt;
+    const Real bby_local = ut*by - uy*bt;
+    const Real bbz_local = ut*bz - uz*bt;
+
+    stencil_prim[s][IBY] = bby_local;
+    stencil_prim[s][IBZ] = bbz_local;
+    stencil_bbx[s] = bbx_local;
+#else
+    (void)alpha; (void)g01_inv; (void)ut;
+#endif
+  }
+  return;
+}

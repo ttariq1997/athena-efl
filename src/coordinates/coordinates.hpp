@@ -188,6 +188,41 @@ class Coordinates {
                     const AthenaArray<Real> &b3_vals, AthenaArray<Real> &prim_left,
                     AthenaArray<Real> &prim_right, AthenaArray<Real> &bx);
 
+  // Stencil-aware tetrad transform for HO GRMHD pipeline (Antón 2006 §3.4).
+  // Transforms a 6-cell stencil straddling face (k, j, i_face) into the local
+  // Minkowski frame at the face. Replaces 6× separate PrimToLocal calls with
+  // L==R, eliminating wide scratch arrays and amortizing tetrad-coef loads.
+  //
+  // Stencil convention: s = 0..5 maps to cell offsets {-3,-2,-1,0,+1,+2}
+  //                     from the face along the sweep direction.
+  //                     s=2 = L cell, s=3 = R cell.
+  //
+  // Output stencil_prim[s][n] uses Athena's NWAVE primitive layout per direction
+  // (same permutation as PrimToLocal[1|2|3]):
+  //   stencil_prim[s][IDN]                = ρ
+  //   stencil_prim[s][IPR]                = P
+  //   stencil_prim[s][IVX/IVY/IVZ]        = tetrad-frame velocities (permuted)
+  //   stencil_prim[s][IBY], [s][IBZ]      = tetrad-frame B^(t1), B^(t2)
+  // stencil_bbx[s] = tetrad-frame face-normal B^(x) per cell.
+  void StencilPrimToLocal1(const int k, const int j, const int i_face,
+                           const Real bn_face,
+                           const AthenaArray<Real> &prim,
+                           const AthenaArray<Real> &bcc,
+                           Real stencil_prim[6][NWAVE],
+                           Real stencil_bbx[6]);
+  void StencilPrimToLocal2(const int k, const int j, const int i_face,
+                           const Real bn_face,
+                           const AthenaArray<Real> &prim,
+                           const AthenaArray<Real> &bcc,
+                           Real stencil_prim[6][NWAVE],
+                           Real stencil_bbx[6]);
+  void StencilPrimToLocal3(const int k, const int j, const int i_face,
+                           const Real bn_face,
+                           const AthenaArray<Real> &prim,
+                           const AthenaArray<Real> &bcc,
+                           Real stencil_prim[6][NWAVE],
+                           Real stencil_bbx[6]);
+
   // ...to transform fluxes in locally flat space to global frame
   void FluxToGlobal1(const int k, const int j, const int il, const int iu,
              const AthenaArray<Real> &cons, const AthenaArray<Real> &bbx,

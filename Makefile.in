@@ -9,6 +9,7 @@ EOS_FILE = @EOS_FILE@
 GENERAL_EOS_FILE = @GENERAL_EOS_FILE@
 RSOLVER_FILE = @RSOLVER_FILE@
 RSOLVER_DIR = @RSOLVER_DIR@
+EFL_RSOLVER_FILE = @EFL_RSOLVER_FILE@
 MPIFFT_FILE = @MPIFFT_FILE@
 CHEMNET_FILE = @CHEMNET_FILE@
 CHEMISTRY_FILE = @CHEMISTRY_FILE@
@@ -65,6 +66,7 @@ SRC_FILES := $(wildcard src/*.cpp) \
              $(wildcard src/cr/integrators/*.cpp) \
              $(wildcard src/crdiffusion/*.cpp) \
 	     src/hydro/rsolvers/$(RSOLVER_DIR)$(RSOLVER_FILE) \
+	     $(wildcard $(EFL_RSOLVER_FILE)) \
 	     $(wildcard src/inputs/*.cpp) \
 	     $(wildcard src/mesh/*.cpp) \
 	     $(wildcard src/multigrid/*.cpp) \

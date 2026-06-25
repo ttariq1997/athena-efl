@@ -905,21 +905,26 @@ TimeIntegratorTaskList::TimeIntegratorTaskList(ParameterInput *pin, Mesh *pm) {
   // Now assemble list of tasks for each stage of time integrator
   {using namespace HydroIntegratorTaskNames; // NOLINT (build/namespace)
     // calculate hydro/field diffusive fluxes
+    TaskID calc_hyd_dep = NONE;
+#if EFL_ENABLED
+    AddTask(CALC_EFL, NONE);
+    calc_hyd_dep = CALC_EFL;
+#endif
     if (!STS_ENABLED) {
       AddTask(DIFFUSE_HYD,NONE);
       if (MAGNETIC_FIELDS_ENABLED) {
         AddTask(DIFFUSE_FLD,NONE);
         // compute hydro fluxes, integrate hydro variables
-        AddTask(CALC_HYDFLX,(DIFFUSE_HYD|DIFFUSE_FLD));
+        AddTask(CALC_HYDFLX,(calc_hyd_dep|DIFFUSE_HYD|DIFFUSE_FLD));
       } else { // Hydro
-        AddTask(CALC_HYDFLX,DIFFUSE_HYD);
+        AddTask(CALC_HYDFLX,(calc_hyd_dep|DIFFUSE_HYD));
       }
       if (NSCALARS > 0) {
         AddTask(DIFFUSE_SCLR,NONE);
         AddTask(CALC_SCLRFLX,(CALC_HYDFLX|DIFFUSE_SCLR));
       }
     } else { // STS enabled:
-      AddTask(CALC_HYDFLX,NONE);
+      AddTask(CALC_HYDFLX,calc_hyd_dep);
       if (NSCALARS > 0)
         AddTask(CALC_SCLRFLX,CALC_HYDFLX);
     }
@@ -1184,6 +1189,11 @@ TimeIntegratorTaskList::TimeIntegratorTaskList(ParameterInput *pin, Mesh *pm) {
 
     AddTask(PHY_BVAL,before_bval);
 
+#if EFL_ENABLED
+    AddTask(SET_ENTROPY_HIST, PHY_BVAL);
+    before_userwork = (before_userwork | SET_ENTROPY_HIST);
+#endif
+
     if (radiation_flag)
       AddTask(RAD_MOMOPACITY,PHY_BVAL);
 
@@ -1230,6 +1240,13 @@ void TimeIntegratorTaskList::AddTask(const TaskID& id, const TaskID& dep) {
         static_cast<TaskStatus (TaskList::*)(MeshBlock*,int)>
         (&TimeIntegratorTaskList::ClearAllBoundary);
     task_list_[ntasks].lb_time = false;
+#if EFL_ENABLED
+  } else if (id == CALC_EFL) {
+    task_list_[ntasks].TaskFunc=
+        static_cast<TaskStatus (TaskList::*)(MeshBlock*,int)>
+        (&TimeIntegratorTaskList::CalculateEFL);
+    task_list_[ntasks].lb_time = false;
+#endif
   } else if (id == CALC_HYDFLX) {
     task_list_[ntasks].TaskFunc=
         static_cast<TaskStatus (TaskList::*)(MeshBlock*,int)>
@@ -1360,6 +1377,13 @@ void TimeIntegratorTaskList::AddTask(const TaskID& id, const TaskID& dep) {
         static_cast<TaskStatus (TaskList::*)(MeshBlock*,int)>
         (&TimeIntegratorTaskList::PhysicalBoundary);
     task_list_[ntasks].lb_time = true;
+#if EFL_ENABLED
+  } else if (id == SET_ENTROPY_HIST) {
+    task_list_[ntasks].TaskFunc=
+        static_cast<TaskStatus (TaskList::*)(MeshBlock*,int)>
+        (&TimeIntegratorTaskList::SetEntropyHistory);
+    task_list_[ntasks].lb_time = false;
+#endif
   } else if (id == USERWORK) {
     task_list_[ntasks].TaskFunc=
         static_cast<TaskStatus (TaskList::*)(MeshBlock*,int)>
@@ -1687,6 +1711,29 @@ TaskStatus TimeIntegratorTaskList::ClearAllBoundary(MeshBlock *pmb, int stage) {
 
   return TaskStatus::success;
 }
+
+//----------------------------------------------------------------------------------------
+#if EFL_ENABLED
+// Functions to update the SR-only entropy-flux limiter once per cycle
+
+TaskStatus TimeIntegratorTaskList::CalculateEFL(MeshBlock *pmb, int stage) {
+  if (stage > nstages) return TaskStatus::fail;
+  if (!stage_wghts[stage-1].main_stage) return TaskStatus::next;
+  if (stage != 1) return TaskStatus::next;
+
+  pmb->phydro->UpdateEFL();
+  return TaskStatus::next;
+}
+
+TaskStatus TimeIntegratorTaskList::SetEntropyHistory(MeshBlock *pmb, int stage) {
+  if (stage > nstages) return TaskStatus::fail;
+  if (!stage_wghts[stage-1].main_stage) return TaskStatus::success;
+  if (stage != nstages) return TaskStatus::success;
+
+  pmb->phydro->AdvanceEntropyHistory();
+  return TaskStatus::success;
+}
+#endif
 
 //----------------------------------------------------------------------------------------
 // Functions to calculates Hydro fluxes

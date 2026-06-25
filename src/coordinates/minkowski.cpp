@@ -18,10 +18,13 @@
 
 // C++ headers
 #include <cmath>  // sqrt()
+#include <sstream>   // for stringstream in StencilPrimToLocal* stubs
+#include <stdexcept>
 
 // Athena++ headers
 #include "../athena.hpp"
 #include "../athena_arrays.hpp"
+#include "../defs.hpp"
 #include "../mesh/mesh.hpp"
 #include "../parameter_input.hpp"
 #include "coordinates.hpp"
@@ -313,3 +316,102 @@ void Coordinates::LowerVectorCell(Real a0, Real a1, Real a2, Real a3, int k, int
   *pa_3 = a3;
   return;
 }
+
+//----------------------------------------------------------------------------------------
+// Stencil-aware tetrad transform for Minkowski. Tetrad is identity, metric is η.
+// Algebraic simplification: B^(face)_tetrad = B^(face)_lab, tangential
+// B^(i)_tetrad = B^(i)_lab. Direction-permuted slot layout matches the GR pgens.
+//
+// Bn convention follows Antón 2006: shared face-Bn for all stencil cells, cell
+// tangential Bcc. This matches the GR-Kerr-Schild implementation and the LO
+// path's Bn handling.
+
+void Coordinates::StencilPrimToLocal1(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face; (void)bcc; (void)stencil_bbx;
+#endif
+
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int ii = i_face + (s - 3);
+    stencil_prim[s][IDN] = prim(IDN, k, j, ii);
+    stencil_prim[s][IPR] = prim(IPR, k, j, ii);
+    // Direction-1 layout: IVX = tetrad-x (face-normal), IVY = tetrad-y, IVZ = tetrad-z
+    stencil_prim[s][IVX] = prim(IVX, k, j, ii);
+    stencil_prim[s][IVY] = prim(IVY, k, j, ii);
+    stencil_prim[s][IVZ] = prim(IVZ, k, j, ii);
+#if MAGNETIC_FIELDS_ENABLED
+    // Algebraic identity in Minkowski (identity tetrad):
+    //   B^(face)_tetrad = γ b^(face) − util^(face) b^0 = Bn  (face value)
+    //   B^(tang)_tetrad = Bcc^(tang)                       (cell value)
+    stencil_prim[s][IBY] = bcc(IB2, k, j, ii);   // tang-y
+    stencil_prim[s][IBZ] = bcc(IB3, k, j, ii);   // tang-z
+    stencil_bbx[s]       = bn_face;              // face-normal x
+#endif
+  }
+}
+
+void Coordinates::StencilPrimToLocal2(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face; (void)bcc; (void)stencil_bbx;
+#endif
+
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int jj = j + (s - 3);
+    stencil_prim[s][IDN] = prim(IDN, k, jj, i_face);
+    stencil_prim[s][IPR] = prim(IPR, k, jj, i_face);
+    // Direction-2 layout: IVY ← tetrad-x (face-normal=y), IVZ ← tetrad-y,
+    //                     IVX ← tetrad-z (z-direction goes here per dir-map)
+    stencil_prim[s][IVY] = prim(IVY, k, jj, i_face);  // face-normal (y)
+    stencil_prim[s][IVZ] = prim(IVZ, k, jj, i_face);  // tang-1 (z)
+    stencil_prim[s][IVX] = prim(IVX, k, jj, i_face);  // tang-2 (x)
+#if MAGNETIC_FIELDS_ENABLED
+    stencil_prim[s][IBY] = bcc(IB3, k, jj, i_face);   // tang-1: B^z
+    stencil_prim[s][IBZ] = bcc(IB1, k, jj, i_face);   // tang-2: B^x
+    stencil_bbx[s]       = bn_face;                    // face-normal: B^y
+#endif
+  }
+}
+
+void Coordinates::StencilPrimToLocal3(
+    const int k, const int j, const int i_face,
+    const Real bn_face,
+    const AthenaArray<Real> &prim,
+    const AthenaArray<Real> &bcc,
+    Real stencil_prim[6][NWAVE],
+    Real stencil_bbx[6]) {
+#if !MAGNETIC_FIELDS_ENABLED
+  (void)bn_face; (void)bcc; (void)stencil_bbx;
+#endif
+
+#pragma omp simd
+  for (int s = 0; s < 6; ++s) {
+    const int kk = k + (s - 3);
+    stencil_prim[s][IDN] = prim(IDN, kk, j, i_face);
+    stencil_prim[s][IPR] = prim(IPR, kk, j, i_face);
+    // Direction-3 layout: IVZ ← tetrad-x (face-normal=z), IVX ← tetrad-y (x),
+    //                     IVY ← tetrad-z (y)
+    stencil_prim[s][IVZ] = prim(IVZ, kk, j, i_face);  // face-normal (z)
+    stencil_prim[s][IVX] = prim(IVX, kk, j, i_face);  // tang-1 (x)
+    stencil_prim[s][IVY] = prim(IVY, kk, j, i_face);  // tang-2 (y)
+#if MAGNETIC_FIELDS_ENABLED
+    stencil_prim[s][IBY] = bcc(IB1, kk, j, i_face);   // tang-1: B^x
+    stencil_prim[s][IBZ] = bcc(IB2, kk, j, i_face);   // tang-2: B^y
+    stencil_bbx[s]       = bn_face;                    // face-normal: B^z
+#endif
+  }
+}
+

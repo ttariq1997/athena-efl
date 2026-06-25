@@ -464,6 +464,10 @@ MeshBlock::MeshBlock(int igid, int ilid, Mesh *pm, ParameterInput *pin,
     os += pfield->b.x3f.GetSizeInBytes();
   }
 
+#if EFL_ENABLED
+  // EFL entropy time-history (must match restart.cpp pack order).
+  os += phydro->EflRestartUnpack(&(mbdata[os]));
+#endif
 
   if (NR_RADIATION_ENABLED || IM_RADIATION_ENABLED) {
     if (pnrrad->restart_from_gray) {
@@ -663,6 +667,9 @@ std::size_t MeshBlock::GetBlockSizeInBytes() {
   if (MAGNETIC_FIELDS_ENABLED)
     size += (pfield->b.x1f.GetSizeInBytes() + pfield->b.x2f.GetSizeInBytes()
              + pfield->b.x3f.GetSizeInBytes());
+#if EFL_ENABLED
+  size += phydro->EflRestartSize();
+#endif
   if (NSCALARS > 0) {
     size += pscalars->s.GetSizeInBytes();
     if (CHEMISTRY_ENABLED) {
@@ -701,6 +708,9 @@ std::size_t MeshBlock::GetBlockSizeInBytesGray() {
   if (MAGNETIC_FIELDS_ENABLED)
     size += (pfield->b.x1f.GetSizeInBytes() + pfield->b.x2f.GetSizeInBytes()
              + pfield->b.x3f.GetSizeInBytes());
+#if EFL_ENABLED
+  size += phydro->EflRestartSize();
+#endif
 
   if (NSCALARS > 0)
     size += pscalars->s.GetSizeInBytes();

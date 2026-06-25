@@ -40,6 +40,7 @@
 #include "globals.hpp"
 #include "gravity/fft_gravity.hpp"
 #include "gravity/mg_gravity.hpp"
+#include "hydro/hydro.hpp"
 #include "mesh/mesh.hpp"
 #include "nr_radiation/implicit/radiation_implicit.hpp"
 #include "nr_radiation/radiation.hpp"
@@ -530,6 +531,48 @@ int main(int argc, char *argv[]) {
     }
 
     pmesh->UserWorkInLoop();
+
+#if EFL_DEBUG
+    // ===== EFL_DEBUG per-cycle diagnostic CSV row =====
+    // Sum HO/biortho counters across local meshblocks and (if MPI) across
+    // ranks, then rank 0 prints one CSV line prefixed by "efl_debug,".
+    // Schema:
+    //   efl_debug,cycle,time,dt,ho_calls,ho_fails,hybridized,pure_ho,
+    //             lr_diag_b0..4,lr_off_b0..4
+    {
+      std::int64_t local[14] = {};
+      for (int b = 0; b < pmesh->nblocal; ++b) {
+        Hydro *ph = pmesh->my_blocks(b)->phydro;
+        local[0]  += ph->GetHOEigCallsCount();
+        local[1]  += ph->GetHOHardFailCount();
+        local[2]  += ph->GetHOHybridizedCount();
+        local[3]  += ph->GetHOPureHOCount();
+        for (int i = 0; i < 5; ++i) {
+          local[4  + i] += ph->GetLRDiagBin(i);
+          local[9  + i] += ph->GetLROffBin(i);
+        }
+      }
+      std::int64_t global[14];
+#ifdef MPI_PARALLEL
+      MPI_Reduce(local, global, 14, MPI_INT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+#else
+      for (int i = 0; i < 14; ++i) global[i] = local[i];
+#endif
+      if (Globals::my_rank == 0) {
+        if (pmesh->ncycle == 0) {
+          std::cout <<
+            "efl_debug,cycle,time,dt,ho_calls,ho_fails,hybridized,pure_ho,"
+            "lr_diag_b0,lr_diag_b1,lr_diag_b2,lr_diag_b3,lr_diag_b4,"
+            "lr_off_b0,lr_off_b1,lr_off_b2,lr_off_b3,lr_off_b4\n";
+        }
+        std::cout << "efl_debug," << pmesh->ncycle
+                  << "," << pmesh->time
+                  << "," << pmesh->dt;
+        for (int i = 0; i < 14; ++i) std::cout << "," << global[i];
+        std::cout << std::endl;
+      }
+    }
+#endif
 
     pmesh->ncycle++;
     pmesh->time += pmesh->dt;

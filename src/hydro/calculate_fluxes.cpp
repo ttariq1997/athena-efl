@@ -10,6 +10,9 @@
 
 // C++ headers
 #include <algorithm>   // min,max
+#include <cmath>       // isfinite
+#include <cstring>     // strcmp
+#include <limits>      // numeric_limits
 
 // Athena++ headers
 #include "../athena.hpp"
@@ -27,6 +30,138 @@
 // OpenMP header
 #ifdef OPENMP_PARALLEL
 #include <omp.h>
+#endif
+
+#if EFL_ENABLED && !MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+namespace {
+// SR-hydro EFL flux blender (no EMF, no CT weight -- pure hydro fluxes only).
+// blend rule:
+//   flux(:, k, j, i) = theta * flux_HO + (1 - theta) * flux_LO,
+// where theta = efl_limiter_x{ivx}(k, j, i) is in [0, 1].  When the HO flux is
+// non-finite (eigensystem failure marked via NaN by the HO driver), the LO
+// flux is kept verbatim (no blend), exactly as in the SRMHD pipeline.
+void CombineFluxesDirHydro(Hydro *ph,
+                           const int k, const int j, const int il, const int iu,
+                           AthenaArray<Real> &flux,
+                           const AthenaArray<Real> &flux_ho,
+                           const AthenaArray<Real> &limiter,
+                           const AthenaArray<Real> &w,
+                           const int dir) {
+  const Real theta_tol = 1.0e-12;
+
+  // Hybrid HO/LO scheme — fully separate from the EFL machinery below.
+  // When hybrid_enable_ is true, the EFL entropy theta is bypassed.  Per face:
+  //   theta = 1 (pure HO) if min(rho_L, rho_R) >= hybrid_rho_cutoff_,
+  //   theta = 0 (pure LO) otherwise.
+  // The non-finite HO flux fallback is preserved (still keeps LO).
+  if (ph->hybrid_enable_) {
+    const Real rho_cut = ph->hybrid_rho_cutoff_;
+    for (int i = il; i <= iu; ++i) {
+      Real rho_low;
+      switch (dir) {
+        case 1:  rho_low = std::min(w(IDN, k, j, i-1), w(IDN, k, j, i)); break;
+        case 2:  rho_low = std::min(w(IDN, k, j-1, i), w(IDN, k, j, i)); break;
+        case 3:  rho_low = std::min(w(IDN, k-1, j, i), w(IDN, k, j, i)); break;
+        default: rho_low = std::numeric_limits<Real>::max();             break;
+      }
+      bool use_lo = (rho_low < rho_cut);
+      if (!use_lo) {
+        for (int n = 0; n < NHYDRO; ++n) {
+          if (!std::isfinite(flux_ho(n, k, j, i))) { use_lo = true; break; }
+        }
+      }
+      if (!use_lo) {
+        for (int n = 0; n < NHYDRO; ++n) {
+          flux(n, k, j, i) = flux_ho(n, k, j, i);
+        }
+      }
+    }
+    return;
+  }
+
+  // Standard EFL path.  Atm protection comes from CalculateEntropyResidual
+  // forcing residual = cmax at body cells whose 7-cell mask touches atm.
+  for (int i = il; i <= iu; ++i) {
+    Real theta = limiter(k, j, i);
+    theta = std::max((Real)0.0, std::min((Real)1.0, theta));
+
+    bool use_lo = false;
+    for (int n = 0; n < NHYDRO; ++n) {
+      use_lo = use_lo || !std::isfinite(flux_ho(n, k, j, i));
+    }
+    if (!use_lo) {
+#if EFL_DEBUG
+      if (theta > theta_tol) {
+        if (theta >= 1.0 - theta_tol) ++ph->ho_pure_ho_;
+        else                          ++ph->ho_hybridized_;
+      }
+#endif
+      for (int n = 0; n < NHYDRO; ++n) {
+        flux(n, k, j, i) = theta * flux_ho(n, k, j, i)
+                         + (1.0 - theta) * flux(n, k, j, i);
+      }
+    }
+  }
+}
+
+}  // namespace
+#endif
+
+#if EFL_ENABLED && MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+namespace {
+
+void CombineFluxesDirMHD(Hydro *ph,
+                        const int k, const int j, const int il, const int iu,
+                        AthenaArray<Real> &flux,
+                        AthenaArray<Real> &emf_a,
+                        AthenaArray<Real> &emf_b,
+                        AthenaArray<Real> &wct,
+                        const AthenaArray<Real> &flux_ho,
+                        const AthenaArray<Real> &emf_a_ho,
+                        const AthenaArray<Real> &emf_b_ho,
+                        const AthenaArray<Real> &limiter,
+                        const AthenaArray<Real> &wl,
+                        const AthenaArray<Real> &wr,
+                        const AthenaArray<Real> &dxw,
+                        const Real dt) {
+  const Real theta_tol = 1.0e-12;
+
+  // Atm protection comes from CalculateEntropyResidual forcing residual = cmax
+  // at body cells whose 7-cell mask stencil touches atm (mask > 0.4).
+  for (int i = il; i <= iu; ++i) {
+    Real theta = limiter(k, j, i);
+    theta = std::max((Real)0.0, std::min((Real)1.0, theta));
+
+    bool use_lo = !std::isfinite(emf_a_ho(k, j, i))
+               || !std::isfinite(emf_b_ho(k, j, i));
+    for (int n = 0; n < NHYDRO; ++n) {
+      use_lo = use_lo || !std::isfinite(flux_ho(n, k, j, i));
+    }
+
+    if (!use_lo) {
+#if EFL_DEBUG
+      if (theta > theta_tol) {
+        if (theta >= 1.0 - theta_tol) ++ph->ho_pure_ho_;
+        else                          ++ph->ho_hybridized_;
+      }
+#endif
+      // Skip blend at theta <= tol — preserves bit-exact LO behavior at θ=0.
+      if (theta > theta_tol) {
+        for (int n = 0; n < NHYDRO; ++n) {
+          flux(n, k, j, i) = theta * flux_ho(n, k, j, i)
+                           + (1.0 - theta) * flux(n, k, j, i);
+        }
+        emf_a(k, j, i) = theta * emf_a_ho(k, j, i) + (1.0 - theta) * emf_a(k, j, i);
+        emf_b(k, j, i) = theta * emf_b_ho(k, j, i) + (1.0 - theta) * emf_b(k, j, i);
+      }
+    }
+
+    wct(k, j, i) = ph->GetWeightForCT(flux(IDN, k, j, i),
+                                      wl(IDN, i), wr(IDN, i), dxw(i), dt);
+  }
+}
+
+}  // namespace
 #endif
 
 //----------------------------------------------------------------------------------------
@@ -58,6 +193,68 @@ void Hydro::CalculateFluxes(AthenaArray<Real> &w, FaceField &b,
   AthenaArray<Real> &flux_fc = scr1_nkji_;
   AthenaArray<Real> &laplacian_all_fc = scr2_nkji_;
 
+#if MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+#if RSOLVER_IS_RUSANOV
+  if (std::strcmp(RIEMANN_SOLVER, "rusanov") == 0) {
+    RusanovFlux(w, u, b, bcc,
+                flux[X1DIR], e3x1, e2x1, w_x1f,
+                flux[X2DIR], e1x2, e3x2, w_x2f,
+                flux[X3DIR], e2x3, e1x3, w_x3f);
+    if (!STS_ENABLED) {
+      AddDiffusionFluxes();
+    }
+    return;
+  }
+#endif
+#endif
+
+#if !MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+#if RSOLVER_IS_RUSANOV
+  // SR hydro HO Rusanov: 5x5 Donat 1998 / Font (2008) eigensystem.
+  // Driven from CalculateFluxes (no per-row line-solver) to mirror the SRMHD
+  // dispatch above.  Phase 1: HO standalone (no EFL blending).
+  if (std::strcmp(RIEMANN_SOLVER, "rusanov") == 0) {
+    if (pmb->pmy_mesh->f2 || pmb->pmy_mesh->f3) {
+      RusanovFlux(w, flux[X1DIR], flux[X2DIR], flux[X3DIR]);
+    } else {
+      RusanovFlux(w, flux[X1DIR]);
+    }
+    if (!STS_ENABLED) {
+      AddDiffusionFluxes();
+    }
+    return;
+  }
+#endif
+#endif
+
+#if EFL_ENABLED && !MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+  // SR-hydro EFL: precompute HO fluxes upfront, then blend per face inside the
+  // directional loop below via CombineFluxesDirHydro.  do_efl is referenced
+  // from those loops, so its scope spans the rest of CalculateFluxes.
+  const bool do_efl = efl_enabled;
+  if (do_efl) {
+    if (pmb->pmy_mesh->f2 || pmb->pmy_mesh->f3) {
+      RusanovFlux(w, ho_x1flux_, ho_x2flux_, ho_x3flux_);
+    } else {
+      RusanovFlux(w, ho_x1flux_);
+    }
+  }
+#endif
+
+#if EFL_ENABLED && MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+  const bool do_efl = efl_enabled;
+  if (do_efl) {
+    if (pmb->pmy_mesh->f2 || pmb->pmy_mesh->f3) {
+      RusanovFlux(w, u, b, bcc,
+                  ho_x1flux_, ho_e3_x1f_, ho_e2_x1f_, w_x1f,
+                  ho_x2flux_, ho_e1_x2f_, ho_e3_x2f_, w_x2f,
+                  ho_x3flux_, ho_e2_x3f_, ho_e1_x3f_, w_x3f);
+    } else {
+      RusanovFlux(w, u, b, bcc, ho_x1flux_, ho_e3_x1f_, ho_e2_x1f_);
+    }
+  }
+#endif
+
   //--------------------------------------------------------------------------------------
   // i-direction
 
@@ -87,10 +284,36 @@ void Hydro::CalculateFluxes(AthenaArray<Real> &w, FaceField &b,
       pmb->pcoord->CenterWidth1(k, j, is, ie+1, dxw_);
 #if !MAGNETIC_FIELDS_ENABLED  // Hydro:
       RiemannSolver(k, j, is, ie+1, IVX, wl_, wr_, x1flux, dxw_);
+#if EFL_ENABLED && RELATIVISTIC_DYNAMICS
+      if (do_efl) {
+        CombineFluxesDirHydro(this, k, j, is, ie+1, x1flux, ho_x1flux_,
+                              efl_limiter_x1, w, 1);
+      }
+#endif
 #else  // MHD:
       // x1flux(IBY) = (v1*b2 - v2*b1) = -EMFZ
       // x1flux(IBZ) = (v1*b3 - v3*b1) =  EMFY
       RiemannSolver(k, j, is, ie+1, IVX, b1, wl_, wr_, x1flux, e3x1, e2x1, w_x1f, dxw_);
+#if EFL_ENABLED && MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+      if (do_efl) {
+#if EFL_DEBUG
+        // Diagnostic snapshot of the LO flux + LO EMFs before the blend.
+        for (int n = 0; n < NHYDRO; ++n) {
+          for (int i = is; i <= ie+1; ++i) {
+            lo_x1flux_(n, k, j, i) = x1flux(n, k, j, i);
+          }
+        }
+        for (int i = is; i <= ie+1; ++i) {
+          lo_e3_x1f_(k, j, i) = e3x1(k, j, i);
+          lo_e2_x1f_(k, j, i) = e2x1(k, j, i);
+        }
+#endif
+        CombineFluxesDirMHD(this, k, j, is, ie+1, x1flux, e3x1, e2x1, w_x1f,
+                            ho_x1flux_, ho_e3_x1f_, ho_e2_x1f_,
+                            efl_limiter_x1,
+                            wl_, wr_, dxw_, pmb->pmy_mesh->dt);
+      }
+#endif
 #endif
 
       if (order == 4) {
@@ -194,10 +417,35 @@ void Hydro::CalculateFluxes(AthenaArray<Real> &w, FaceField &b,
         pmb->pcoord->CenterWidth2(k, j, il, iu, dxw_);
 #if !MAGNETIC_FIELDS_ENABLED  // Hydro:
         RiemannSolver(k, j, il, iu, IVY, wl_, wr_, x2flux, dxw_);
+#if EFL_ENABLED && RELATIVISTIC_DYNAMICS
+        if (do_efl) {
+          CombineFluxesDirHydro(this, k, j, il, iu, x2flux, ho_x2flux_,
+                                efl_limiter_x2, w, 2);
+        }
+#endif
 #else  // MHD:
         // flx(IBY) = (v2*b3 - v3*b2) = -EMFX
         // flx(IBZ) = (v2*b1 - v1*b2) =  EMFZ
         RiemannSolver(k, j, il, iu, IVY, b2, wl_, wr_, x2flux, e1x2, e3x2, w_x2f, dxw_);
+#if EFL_ENABLED && MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+        if (do_efl) {
+#if EFL_DEBUG
+          for (int n = 0; n < NHYDRO; ++n) {
+            for (int i = il; i <= iu; ++i) {
+              lo_x2flux_(n, k, j, i) = x2flux(n, k, j, i);
+            }
+          }
+          for (int i = il; i <= iu; ++i) {
+            lo_e1_x2f_(k, j, i) = e1x2(k, j, i);
+            lo_e3_x2f_(k, j, i) = e3x2(k, j, i);
+          }
+#endif
+          CombineFluxesDirMHD(this, k, j, il, iu, x2flux, e1x2, e3x2, w_x2f,
+                              ho_x2flux_, ho_e1_x2f_, ho_e3_x2f_,
+                              efl_limiter_x2,
+                              wl_, wr_, dxw_, pmb->pmy_mesh->dt);
+        }
+#endif
 #endif
 
         if (order == 4) {
@@ -300,10 +548,35 @@ void Hydro::CalculateFluxes(AthenaArray<Real> &w, FaceField &b,
         pmb->pcoord->CenterWidth3(k, j, il, iu, dxw_);
 #if !MAGNETIC_FIELDS_ENABLED  // Hydro:
         RiemannSolver(k, j, il, iu, IVZ, wl_, wr_, x3flux, dxw_);
+#if EFL_ENABLED && RELATIVISTIC_DYNAMICS
+        if (do_efl) {
+          CombineFluxesDirHydro(this, k, j, il, iu, x3flux, ho_x3flux_,
+                                efl_limiter_x3, w, 3);
+        }
+#endif
 #else  // MHD:
         // flx(IBY) = (v3*b1 - v1*b3) = -EMFY
         // flx(IBZ) = (v3*b2 - v2*b3) =  EMFX
         RiemannSolver(k, j, il, iu, IVZ, b3, wl_, wr_, x3flux, e2x3, e1x3, w_x3f, dxw_);
+#if EFL_ENABLED && MAGNETIC_FIELDS_ENABLED && RELATIVISTIC_DYNAMICS
+        if (do_efl) {
+#if EFL_DEBUG
+          for (int n = 0; n < NHYDRO; ++n) {
+            for (int i = il; i <= iu; ++i) {
+              lo_x3flux_(n, k, j, i) = x3flux(n, k, j, i);
+            }
+          }
+          for (int i = il; i <= iu; ++i) {
+            lo_e2_x3f_(k, j, i) = e2x3(k, j, i);
+            lo_e1_x3f_(k, j, i) = e1x3(k, j, i);
+          }
+#endif
+          CombineFluxesDirMHD(this, k, j, il, iu, x3flux, e2x3, e1x3, w_x3f,
+                              ho_x3flux_, ho_e2_x3f_, ho_e1_x3f_,
+                              efl_limiter_x3,
+                              wl_, wr_, dxw_, pmb->pmy_mesh->dt);
+        }
+#endif
 #endif
         if (order == 4) {
           for (int n=0; n<NWAVE; n++) {

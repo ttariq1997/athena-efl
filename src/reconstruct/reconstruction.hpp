@@ -30,6 +30,8 @@ class Reconstruction {
   // data
   // switches for reconstruction method variants:
   int xorder;   // roughly the formal order of accuracy of overall reconstruction method
+  enum class PrimitiveReconVariant { ppm, weno5, weno5z };
+  PrimitiveReconVariant primitive_recon_variant{PrimitiveReconVariant::ppm};
   bool characteristic_projection; // reconstruct on characteristic or primitive hydro vars
   bool uniform[3], curvilinear[2];
   // (Cartesian reconstruction formulas are used for x3 azimuthal coordinate in both
@@ -167,6 +169,10 @@ class Reconstruction {
                             const AthenaArray<Real> &q, const int array_order,
                             AthenaArray<Real> &ql, AthenaArray<Real> &qr);
 
+  bool UsesWenoReconstruction() const {
+    return primitive_recon_variant != PrimitiveReconVariant::ppm;
+  }
+
   void DonorCellZeta(NRRadiation *prad, const int zs, const int ze,
       AthenaArray<Real> &q,
       AthenaArray<Real> &ql, AthenaArray<Real> &qr);
@@ -200,5 +206,59 @@ class Reconstruction {
   AthenaArray<Real> scr1_in2_, scr2_in2_, scr3_in2_, scr4_in2_;
   AthenaArray<Real> scr1_nn_, scr2_nn_, scr3_nn_, scr4_nn_;
   AthenaArray<Real> scr6_in_, scr7_in_, scr8_in_;
+
+  void ReconstructWeno5X1(const AthenaArray<Real> &z,
+                          AthenaArray<Real> &zl_,
+                          AthenaArray<Real> &zr_,
+                          const int n_tar,
+                          const int n_src,
+                          const int k,
+                          const int j,
+                          const int il, const int iu);
+
+  void ReconstructWeno5X2(const AthenaArray<Real> &z,
+                          AthenaArray<Real> &zl_,
+                          AthenaArray<Real> &zr_,
+                          const int n_tar,
+                          const int n_src,
+                          const int k,
+                          const int j,
+                          const int il, const int iu);
+
+  void ReconstructWeno5X3(const AthenaArray<Real> &z,
+                          AthenaArray<Real> &zl_,
+                          AthenaArray<Real> &zr_,
+                          const int n_tar,
+                          const int n_src,
+                          const int k,
+                          const int j,
+                          const int il, const int iu);
+
+  void ReconstructWeno5ZX1(const AthenaArray<Real> &z,
+                           AthenaArray<Real> &zl_,
+                           AthenaArray<Real> &zr_,
+                           const int n_tar,
+                           const int n_src,
+                           const int k,
+                           const int j,
+                           const int il, const int iu);
+
+  void ReconstructWeno5ZX2(const AthenaArray<Real> &z,
+                           AthenaArray<Real> &zl_,
+                           AthenaArray<Real> &zr_,
+                           const int n_tar,
+                           const int n_src,
+                           const int k,
+                           const int j,
+                           const int il, const int iu);
+
+  void ReconstructWeno5ZX3(const AthenaArray<Real> &z,
+                           AthenaArray<Real> &zl_,
+                           AthenaArray<Real> &zr_,
+                           const int n_tar,
+                           const int n_src,
+                           const int k,
+                           const int j,
+                           const int il, const int iu);
 };
 #endif // RECONSTRUCT_RECONSTRUCTION_HPP_

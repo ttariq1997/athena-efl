@@ -698,6 +698,192 @@ void OutputType::LoadOutputData(MeshBlock *pmb) {
     num_vars_++;
   }
 
+#if EFL_ENABLED
+  if (ContainVariable(output_params.variable, "efl_x1")) {
+    pod = new OutputData;
+    pod->type = "SCALARS";
+    pod->name = "ef_limiter_x1";
+    pod->data.InitWithShallowSlice(phyd->efl_limiter_x1, 4, 0, 1);
+    AppendOutputDataNode(pod);
+    num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "efl_x2") && pmb->pmy_mesh->f2) {
+    pod = new OutputData;
+    pod->type = "SCALARS";
+    pod->name = "ef_limiter_x2";
+    pod->data.InitWithShallowSlice(phyd->efl_limiter_x2, 4, 0, 1);
+    AppendOutputDataNode(pod);
+    num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "efl_x3") && pmb->pmy_mesh->f3) {
+    pod = new OutputData;
+    pod->type = "SCALARS";
+    pod->name = "ef_limiter_x3";
+    pod->data.InitWithShallowSlice(phyd->efl_limiter_x3, 4, 0, 1);
+    AppendOutputDataNode(pod);
+    num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "ent_residual")) {
+    pod = new OutputData;
+    pod->type = "SCALARS";
+    pod->name = "entropy_residual";
+    pod->data.InitWithShallowSlice(phyd->entropy_residual, 4, 0, 1);
+    AppendOutputDataNode(pod);
+    num_vars_++;
+  }
+
+  // HO flux dumps (production-critical for the blender; always available).
+  {
+    const char *fcomps[5] = {"d", "m1", "m2", "m3", "e"};
+    const int   fidx[5]   = {IDN, IM1, IM2, IM3, IEN};
+    AthenaArray<Real> *ho_arrs[3] = {
+      &phyd->ho_x1flux_, &phyd->ho_x2flux_, &phyd->ho_x3flux_};
+    const char *ho_names[3] = {"flux_ho_x1", "flux_ho_x2", "flux_ho_x3"};
+    const bool ho_active[3] = {true, pmb->pmy_mesh->f2, pmb->pmy_mesh->f3};
+    for (int g = 0; g < 3; ++g) {
+      if (!ho_active[g]) continue;
+      if (!ContainVariable(output_params.variable, ho_names[g])) continue;
+      for (int c = 0; c < NHYDRO; ++c) {
+        pod = new OutputData;
+        pod->type = "SCALARS";
+        pod->name = std::string(ho_names[g]) + "_" + fcomps[c];
+        pod->data.InitWithShallowSlice(*ho_arrs[g], 4, fidx[c], 1);
+        AppendOutputDataNode(pod);
+        num_vars_++;
+      }
+    }
+#if EFL_DEBUG
+    // LO flux snapshot dumps (diagnostic; EFL_DEBUG only).
+    AthenaArray<Real> *lo_arrs[3] = {
+      &phyd->lo_x1flux_, &phyd->lo_x2flux_, &phyd->lo_x3flux_};
+    const char *lo_names[3] = {"flux_lo_x1", "flux_lo_x2", "flux_lo_x3"};
+    for (int g = 0; g < 3; ++g) {
+      if (!ho_active[g]) continue;
+      if (!ContainVariable(output_params.variable, lo_names[g])) continue;
+      for (int c = 0; c < NHYDRO; ++c) {
+        pod = new OutputData;
+        pod->type = "SCALARS";
+        pod->name = std::string(lo_names[g]) + "_" + fcomps[c];
+        pod->data.InitWithShallowSlice(*lo_arrs[g], 4, fidx[c], 1);
+        AppendOutputDataNode(pod);
+        num_vars_++;
+      }
+    }
+#endif
+  }
+
+#if MAGNETIC_FIELDS_ENABLED
+  // HO EMF dumps — production-critical (used by the blender; always available).
+  if (ContainVariable(output_params.variable, "emf_ho_x1")) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_ho_x1_e3";
+    pod->data.InitWithShallowSlice(phyd->ho_e3_x1f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_ho_x1_e2";
+    pod->data.InitWithShallowSlice(phyd->ho_e2_x1f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "emf_ho_x2") && pmb->pmy_mesh->f2) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_ho_x2_e1";
+    pod->data.InitWithShallowSlice(phyd->ho_e1_x2f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_ho_x2_e3";
+    pod->data.InitWithShallowSlice(phyd->ho_e3_x2f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "emf_ho_x3") && pmb->pmy_mesh->f3) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_ho_x3_e2";
+    pod->data.InitWithShallowSlice(phyd->ho_e2_x3f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_ho_x3_e1";
+    pod->data.InitWithShallowSlice(phyd->ho_e1_x3f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+#if EFL_DEBUG
+  // LO EMF snapshot dumps (diagnostic; EFL_DEBUG only).
+  if (ContainVariable(output_params.variable, "emf_lo_x1")) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_lo_x1_e3";
+    pod->data.InitWithShallowSlice(phyd->lo_e3_x1f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_lo_x1_e2";
+    pod->data.InitWithShallowSlice(phyd->lo_e2_x1f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "emf_lo_x2") && pmb->pmy_mesh->f2) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_lo_x2_e1";
+    pod->data.InitWithShallowSlice(phyd->lo_e1_x2f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_lo_x2_e3";
+    pod->data.InitWithShallowSlice(phyd->lo_e3_x2f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "emf_lo_x3") && pmb->pmy_mesh->f3) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_lo_x3_e2";
+    pod->data.InitWithShallowSlice(phyd->lo_e2_x3f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_lo_x3_e1";
+    pod->data.InitWithShallowSlice(phyd->lo_e1_x3f_, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+#endif
+  // FINAL blended EMFs (post CombineFluxesDir).  Read live from
+  // pmb->pfield->e3_x1f etc.  Output runs at end of cycle, before next
+  // CalculateFluxes overwrites these — so they reflect the most recent
+  // blended values.
+  if (ContainVariable(output_params.variable, "emf_x1")) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_x1_e3";
+    pod->data.InitWithShallowSlice(pmb->pfield->e3_x1f, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_x1_e2";
+    pod->data.InitWithShallowSlice(pmb->pfield->e2_x1f, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "emf_x2") && pmb->pmy_mesh->f2) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_x2_e1";
+    pod->data.InitWithShallowSlice(pmb->pfield->e1_x2f, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_x2_e3";
+    pod->data.InitWithShallowSlice(pmb->pfield->e3_x2f, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+  if (ContainVariable(output_params.variable, "emf_x3") && pmb->pmy_mesh->f3) {
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_x3_e2";
+    pod->data.InitWithShallowSlice(pmb->pfield->e2_x3f, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+    pod = new OutputData; pod->type = "SCALARS"; pod->name = "emf_x3_e1";
+    pod->data.InitWithShallowSlice(pmb->pfield->e1_x3f, 4, 0, 1);
+    AppendOutputDataNode(pod); num_vars_++;
+  }
+#endif
+#endif
+
+#if EFL_ENABLED && RELATIVISTIC_DYNAMICS
+  // FINAL blended hydrodynamic flux (post CombineFluxesDir).  Read live
+  // from phyd->flux[X1/X2/X3].  Output runs at end of cycle, before next
+  // CalculateFluxes overwrites these.  Components emitted as scalars to
+  // mirror the flux_lo/flux_ho convention.
+  {
+    const char *fcomps[5] = {"d", "m1", "m2", "m3", "e"};
+    const int   fidx[5]   = {IDN, IM1, IM2, IM3, IEN};
+    AthenaArray<Real> *flux_arrs[3] = {
+      &phyd->flux[X1DIR], &phyd->flux[X2DIR], &phyd->flux[X3DIR]};
+    const char *flux_names[3] = {"flux_x1", "flux_x2", "flux_x3"};
+    const bool flux_active[3] = {
+      true, pmb->pmy_mesh->f2, pmb->pmy_mesh->f3};
+    for (int g = 0; g < 3; ++g) {
+      if (!flux_active[g]) continue;
+      if (!ContainVariable(output_params.variable, flux_names[g])) continue;
+      for (int c = 0; c < NHYDRO; ++c) {
+        pod = new OutputData;
+        pod->type = "SCALARS";
+        pod->name = std::string(flux_names[g]) + "_" + fcomps[c];
+        pod->data.InitWithShallowSlice(*flux_arrs[g], 4, fidx[c], 1);
+        AppendOutputDataNode(pod);
+        num_vars_++;
+      }
+    }
+  }
+#endif
+
   if (SELF_GRAVITY_ENABLED) {
     if (ContainVariable(output_params.variable, "phi") ||
         ContainVariable(output_params.variable, "prim") ||

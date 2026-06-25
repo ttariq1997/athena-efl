@@ -24,10 +24,13 @@
 
 // C++ headers
 #include <cmath>  // abs(), acos(), cos(), log(), pow(), sin(), sqrt()
+#include <sstream>   // for stringstream in StencilPrimToLocal* stubs
+#include <stdexcept>
 
 // Athena++ headers
 #include "../athena.hpp"
 #include "../athena_arrays.hpp"
+#include "../defs.hpp"
 #include "../eos/eos.hpp"
 #include "../mesh/mesh.hpp"
 #include "../parameter_input.hpp"
@@ -1458,4 +1461,37 @@ void Coordinates::LowerVectorCell(Real a0, Real a1, Real a2, Real a3, int k, int
   *pa_2 = g_22 * a2;
   *pa_3 = g_33 * a3;
   return;
+}
+
+//----------------------------------------------------------------------------------------
+// Stencil-aware tetrad transform stubs. Not implemented for Schwarzschild.
+// HO+EFL+GR runs use Kerr-Schild — see kerr-schild.cpp for the live impl.
+
+void Coordinates::StencilPrimToLocal1(
+    const int, const int, const int, const Real,
+    const AthenaArray<Real> &, const AthenaArray<Real> &,
+    Real [6][NWAVE], Real [6]) {
+  std::stringstream msg;
+  msg << "### FATAL ERROR in Coordinates::StencilPrimToLocal1 (Schwarzschild)\n"
+      << "Stencil-aware tetrad transform not implemented for Schwarzschild.\n"
+      << "Use Kerr-Schild for HO+EFL GR runs, or implement this function.\n";
+  ATHENA_ERROR(msg);
+}
+void Coordinates::StencilPrimToLocal2(
+    const int, const int, const int, const Real,
+    const AthenaArray<Real> &, const AthenaArray<Real> &,
+    Real [6][NWAVE], Real [6]) {
+  std::stringstream msg;
+  msg << "### FATAL ERROR in Coordinates::StencilPrimToLocal2 (Schwarzschild)\n"
+      << "Stencil-aware tetrad transform not implemented for Schwarzschild.\n";
+  ATHENA_ERROR(msg);
+}
+void Coordinates::StencilPrimToLocal3(
+    const int, const int, const int, const Real,
+    const AthenaArray<Real> &, const AthenaArray<Real> &,
+    Real [6][NWAVE], Real [6]) {
+  std::stringstream msg;
+  msg << "### FATAL ERROR in Coordinates::StencilPrimToLocal3 (Schwarzschild)\n"
+      << "Stencil-aware tetrad transform not implemented for Schwarzschild.\n";
+  ATHENA_ERROR(msg);
 }
