@@ -1,0 +1,172 @@
+<comment>
+problem   = 3D GRMHD FM torus
+reference = Event horizon paper.
+configure = -g -b --prob=gr_torus --coord=kerr-schild --flux=llf \
+            --nghost=4 -efl -hdf5 -mpi --hdf5_path=...
+
+
+<job>
+problem_id = fm_torus
+
+<time>
+cfl_number = 0.3
+nlim       = 1                 
+tlim       = 10000              
+integrator = vl2                
+xorder     = 3                  # low order reconstruction method
+xorder_HO  = cs5             	# high order reconstruction 
+ncycle_out = 100               
+
+<output1>
+file_type   = hst
+dt          = 1.0
+data_format = %24.16e
+
+<output2>
+file_type   = hdf5
+variable    = prim
+id          = prim
+dt          = 10.0
+xdmf        = 0
+data_format = float
+
+<output3>
+file_type   = hdf5
+variable    = ent_residual
+id          = ent_residual
+dt          = 10.0
+xdmf        = 0
+data_format = float
+
+<output4>
+file_type   = rst
+dt          = 100.0
+
+<mesh>
+num_threads = 1
+
+nx1    = 32
+x1min  = 1.20
+x1max  = 50.0
+x1rat  = 1.1236  # x1rat = (x1max / x1min)^(1/nx1)
+ix1_bc = user                  
+ox1_bc = user                   
+
+nx2    = 32
+x2min  = 0.0
+x2max  = 3.14159265358979324
+x2rat  = 1.0
+ix2_bc = polar                 
+ox2_bc = polar
+
+nx3    = 32
+x3min  = 0.0
+x3max  = 6.28318530717958648
+x3rat  = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+refinement = static
+
+<meshblock>
+nx1 = 8
+nx2 = 4
+nx3 = 16
+
+<refinement1>
+level = 2
+x1min = 1.20
+x1max = 50.0
+x2min = 0.5890486225480862   # 3*pi/16
+x2max = 2.5525440310417069   # 13*pi/16  
+x3min = 0.0
+x3max = 6.28318530717958648
+
+<refinement2>
+level = 2
+x1min = 19.68                   
+x1max = 50.0
+x2min = 0.19634954084936207  # π/16    
+x2max = 2.945243112740431    # 15*pi/16    
+x3min = 0.0
+x3max = 6.28318530717958648
+
+<coord>
+m = 1.0
+a = 0.9375                       # r_h = 1.349 M
+h = 1.0
+
+<hydro>
+gamma          = 1.33333333333333333  # 4/3 
+
+# ρ > 1e-5 · r^-1.5,  p > (1/3)·1e-7 · r^-2.5,  σ < 100,  β > 1e-3
+#   rho_min · 50^-1.5   = 2.83e-8  
+#   pgas_min · 50^-2.5  = 1.88e-12 
+dfloor         = 2.83e-8               
+pfloor         = 1.88e-12               
+rho_min        = 1.0e-5                
+rho_pow        = -1.5
+pgas_min       = 3.33333333e-8        
+pgas_pow       = -2.5
+sigma_max      = 100.0                
+beta_min       = 0.001                 
+gamma_max      = 50.0                  
+
+# HO scheme 
+ho_recon_mode  = componentwise    
+    
+#EFL related knobs
+efl_enable          = true
+efl_cE              = 1.0
+efl_cmax            = 1.0
+efl_buffer_cycles   = 4                # 4-cycle buffer
+
+#Atm mask for efl scheme skips the high order mehtod in atmposphere
+
+efl_atm_mask_enable  = false      #Atm mask
+efl_atm_threshold    = 1e2                                     # rho_atm_th 
+
+<problem> 
+prograde   = true
+r_edge     = 6.0                       
+r_peak     = 12.0                     
+l          = 4.28                      # constant l = u_φ u^t
+r_peak_max = 1000.0
+rho_max    = 1.0
+tilt_angle = 0.0
+
+#Magnetic field configuration
+# A_φ ∝ max(ρ/ρ_max − 0.2, 0)
+
+field_config   = density
+pot_r_pow      = 0.0
+pot_rho_pow    = 1.0
+pot_rho_cutoff = 0.2                  
+
+pot_r_min       = 8.0
+pot_r_max       = 25.0
+pot_r_num       = 1
+pot_theta_min   = 1.30899693899574717  # 5π/12  (near midplane)
+pot_theta_num   = 1
+pot_pgas_pow    = 0.5
+pot_pgas_cutoff = 1.0e-8
+pot_samples     = 5
+
+#  2 p_max / B²_max should be 100 to match literautre needs callibration. 
+pot_amp        = 0.30                  
+
+# Initial perturbation 
+
+pert_type      = pressure              
+pert_pgas_max  = 0.02                  # X_p ∈ [-0.02, +0.02] 
+pert_seed      = 42                    
+# Velocity-perturbation params (unused)
+pert_amp = 0.0
+pert_kr  = 0.0
+pert_kz  = 0.0
+
+# ─── Horizon-penetrating flux radii for hst output ───────────────────
+# flux_radius_1 near horizon
+num_flux_radii = 2
+flux_radius_1  = 1.500
+flux_radius_2  = 6.0
