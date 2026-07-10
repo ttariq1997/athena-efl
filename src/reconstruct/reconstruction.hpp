@@ -48,6 +48,26 @@ class Reconstruction {
   AthenaArray<Real> c1k, c2k, c3k, c4k, c5k, c6k;  // coefficients for PPM in x3
   AthenaArray<Real> hplus_ratio_k, hminus_ratio_k; // for curvilinear PPMx3
 
+  // ------------------------------------------------------------------------
+  // Non-uniform CS5 reconstruction weights (Mignone 2014 Eq. 16 / Eq. 23,
+  // m_coord = 0 / Cartesian Jacobian).  Only the radial (x1) direction is
+  // supported because θ and φ are uniform by convention for the EFL pipeline.
+  //
+  // Two stencils per face for the Lax-Friedrichs flux split (see
+  // ReconCharFieldsStencilSRMHD): "+ stencil" cells {i-3..i+1} and "- stencil"
+  // cells {i-2..i+2}, both reconstructing the face value at r = x1f(i).
+  // The - stencil weights are stored REVERSED to match the existing code's
+  // flux_stencil_m reversal trick (see CharacteristicFieldsRMHD.hpp).
+  //
+  // Activation: cs5_use_nonuniform_i == true iff x1rat != 1.0.  When false,
+  // the runtime path uses the existing hardcoded textbook (2,-13,47,27,-3)/60.
+  // For the uniform case the precomputed weights collapse to the textbook
+  // values (verified bit-identically in vis/python/verify_cs5_nonuniform.py).
+  // ------------------------------------------------------------------------
+  bool cs5_use_nonuniform_i{false};
+  AthenaArray<Real> cs5_wp_s0_i, cs5_wp_s1_i, cs5_wp_s2_i, cs5_wp_s3_i, cs5_wp_s4_i;
+  AthenaArray<Real> cs5_wm_s0_i, cs5_wm_s1_i, cs5_wm_s2_i, cs5_wm_s3_i, cs5_wm_s4_i;
+
   // functions
   // linear transformations of vectors between primitive and characteristic variables
   void LeftEigenmatrixDotVector(

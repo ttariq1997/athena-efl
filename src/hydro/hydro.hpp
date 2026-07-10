@@ -69,13 +69,16 @@ class Hydro {
   Real ho_b2_min_eig_{0.0};
 
   // Master enable for the b² gate.  When false the threshold check is
-  // bypassed entirely (HO runs regardless of avg.bsq).  Default true
-  // preserves legacy behaviour: with the threshold default = 0.0 the
-  // gate trips only at exactly-zero bsq, which is the historical
-  // safety net.  Use false to allow CS5 to fire even on truly zero-B
-  // faces (useful for diagnosing whether HO/LO transitions at the
-  // field-cutoff drive entropy accumulation).
-  bool ho_b2_gate_enable_{true};
+  // bypassed entirely (HO runs regardless of avg.bsq).
+  //
+  // Default false: the SRMHD test suite (Balsara/Komissarov/MUB shock
+  // tubes, CPAW) needs HO to fire at B=0 regions; Antón's Type-I
+  // degeneracy handling covers it without external gating.  GRMHD
+  // FM-torus decks that want the b² guard set this true explicitly
+  // (see athinput.fm_torus_porth19_prod_efl* and native_efl* decks).
+  // Use false explicitly for diagnosing HO/LO transitions at the
+  // field-cutoff.
+  bool ho_b2_gate_enable_{false};
 
   // Hard Bn² minimum for HO eigensystem (face-normal magnetic field
   // squared in the tetrad/SR frame at the avg state).  Companion to
@@ -94,7 +97,52 @@ class Hydro {
 
   // Master enable for the Bn² gate.  See ho_b2_gate_enable_ for
   // semantics — same on/off pattern, applied to the Bn² threshold.
-  bool ho_bn_gate_enable_{true};
+  //
+  // Default false: Antón's own Type-I degeneracy branch (Bn → 0)
+  // handles the eigenvector construction internally by switching
+  // the tangential basis; external gating is redundant unless the
+  // user is stress-testing extreme Bn/|b| ratios.  GRMHD FM-torus
+  // decks that want the guard set this explicitly.
+  bool ho_bn_gate_enable_{false};
+
+  // Stencil-wide b² gate: HO reconstruction uses a 6-cell stencil along
+  // the recon direction.  If any cell in the stencil has cell-centered
+  // B² below this threshold, the smoothness assumption underlying CS5
+  // (and WENO5/WENO5Z) breaks for the B-components, and the HO output
+  // can poison the EFL blend.  Falls back to LO entirely at that face.
+  // Uses LAB-FRAME B² as a cheap conservative proxy (B²=0 → b²=0
+  // regardless of W or v·B alignment).  Stricter than the face-avg b²
+  // gate (ho_b2_min_eig_) — covers all 6 cells contributing to recon,
+  // not just the L+R pair forming the face-avg.
+  // Default 0.0 → disabled (bit-identical to legacy behaviour).
+  Real ho_b2_stencil_min_{0.0};
+
+  // HO reconstruction mode (input knob `hydro/ho_recon_mode`):
+  //   0 = auto           — try Anton characteristic; on strict L·R failure fall
+  //                        through to componentwise (default).
+  //   1 = characteristic — force Anton characteristic path (legacy bit-identical
+  //                        behavior; use for GRMHD FM-torus decks that were
+  //                        validated with the characteristic pipeline).
+  //   2 = componentwise  — force components split (Guercilena+17 §2.2 Eq. 7);
+  //                        skip Anton eigsys entirely.  Use for SR-MHD rotor
+  //                        and similar tests where Anton renormalized
+  //                        eigenvectors are ill-conditioned in smooth flow.
+  // Values match characterisiticfields::rmhd::HO_MODE_{AUTO,CHARACTERISTIC,
+  // COMPONENTWISE}.  Kept as plain int to avoid pulling the full eigsys header
+  // into every translation unit that includes hydro.hpp.
+  int ho_recon_mode_{0};
+
+  // Opt-in strict biorthogonality check for the InvertMatrixRMHD fallback in
+  // GetEigenVectorSRMHD (input knob `hydro/ho_strict_fallback_check`).
+  //   false (default) — accept L unconditionally when the linear solve
+  //                     succeeds.  Bit-identical to legacy code.
+  //   true            — additionally require L·R ≈ I to the adaptive tolerance
+  //                     used in GetLeftEigenVectorSRMHD.  Costs one extra 7×7
+  //                     matmul + max-scan per fallback call; only paid on the
+  //                     rare code path where the analytic left construction
+  //                     already failed.  Recommended when ho_recon_mode = auto
+  //                     so bad fallback L is caught and routed to Tier-2.
+  bool ho_strict_fallback_check_{false};
 
 #if EFL_ENABLED
   AthenaArray<Real> efl_limiter_x1;  // x1 face limiter used by SR-only EFL
@@ -247,6 +295,9 @@ class Hydro {
   // printed as a CSV row prefixed by "efl_debug,".
   std::int64_t GetHOEigCallsCount()    const { return ho_eig_calls_; }
   std::int64_t GetHOHardFailCount()    const { return ho_hard_fail_; }
+  std::int64_t GetHOTier1CallsCount()  const { return ho_tier1_calls_; }
+  std::int64_t GetHOTier2CallsCount()  const { return ho_tier2_calls_; }
+  std::int64_t GetHOTier1RejectCount() const { return ho_tier1_reject_; }
   std::int64_t GetHOHybridizedCount()  const { return ho_hybridized_; }
   std::int64_t GetHOPureHOCount()      const { return ho_pure_ho_; }
   std::int64_t GetLRDiagBin(int b)     const {
@@ -287,9 +338,24 @@ class Hydro {
 
 #if EFL_DEBUG
   // High-order eigensystem counters (per-cycle, diagnostic only).
+  // Public so the free-function RusanovFluxDir in rusanov_mhd_rel.cpp
+  // can increment them directly, matching the pattern of the other
+  // EFL_DEBUG counters at the top of the class (ho_hybridized_,
+  // ho_pure_ho_, lr_diag_bins_, lr_off_bins_).
+ public:
   std::int64_t ho_eig_calls_{0};
   std::int64_t ho_hard_fail_{0};
+  // Tier routing counters (2026-07 componentwise LF path):
+  //   ho_tier1_calls_  = characteristic (Anton eigsys) path taken and used
+  //   ho_tier2_calls_  = componentwise (LF split on physical F,U) path taken
+  //   ho_tier1_reject_ = auto mode: strict L·R check rejected Tier-1 → Tier-2 fired
+  // ho_eig_calls_ / ho_hard_fail_ continue to count eigsys ATTEMPTS and
+  // hard-fails independently (they are lower-level than the tier routing).
+  std::int64_t ho_tier1_calls_{0};
+  std::int64_t ho_tier2_calls_{0};
+  std::int64_t ho_tier1_reject_{0};
   int ho_counter_cycle_{-1};
+ private:
 #endif
 
 #if EFL_ENABLED

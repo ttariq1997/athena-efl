@@ -4,21 +4,29 @@ reference = Mignone & Bodo 2005, MNRAS 364 126
 configure = -s --prob gr_shock_tube --coord cartesian [--nscalars 1]
 
 <job>
-problem_id = hydro_shock_rel_3
+problem_id = hydro_shock_rel_3_llf
 
 <output1>
 file_type   = tab
-variable    = cons
+variable    = prim
 data_format = %24.16e
 dt          = 0.4
 
+#<output2>
+#file_type   = tab
+#variable    = efl_x1
+#data_format = %24.16e
+#dt          = 0.4
+
+
 <time>
-cfl_number = 0.4
+cfl_number = 0.25
 nlim       = -1
 tlim       = 0.4
-integrator = vl2
-xorder     = 2
+integrator = rk3
+xorder     = weno5z
 ncycle_out = 1
+xorder_HO  = cs5
 
 <mesh>
 nx1    = 400      # number of cells in x-direction
@@ -42,6 +50,11 @@ ox3_bc = periodic  # upper boundary
 <hydro>
 gamma  = 1.6666666666666667  # ratio of specific heats Gamma
 sfloor = 0.0                 # passive scalar floor
+efl_enable = true
+efl_cE     = 1.0
+efl_cmax   = 1.0
+efl_buffer_cycles = 3
+
 
 <problem>
 shock_dir = 1    # 1/2/3 for x/y/z-directions
@@ -54,7 +67,7 @@ vl = 0.0                 # left 3-velocity v^y
 wl = 0.0                 # left 3-velocity v^z
 
 dr = 1.0                   # right density rho
-pr = 6.666666666666666e-7  # right gas pressure p_gas
+pr = 6.666666666666666e-4  # right gas pressure p_gas
 ur = 0.0                   # right 3-velocity v^x
 vr = 0.0                   # right 3-velocity v^y
 wr = 0.0                   # right 3-velocity v^z

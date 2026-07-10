@@ -226,6 +226,20 @@ Reconstruction::Reconstruction(MeshBlock *pmb, ParameterInput *pin) :
   if (pmb->block_size.x3rat != 1.0)
     uniform[X3DIR] = false;
 
+  // WENO5 / WENO5Z stencil weights assume constant Δx in code coordinates.
+  // Curvilinear grids with x{1,2,3}rat = 1.0 are allowed (reconstruction is done in
+  // code coords; geometric source terms handle the metric).  Non-uniform spacing
+  // (x{i}rat != 1.0) breaks the stencil and produces wrong reconstruction.
+  if (UsesWenoReconstruction()) {
+    if (!uniform[X1DIR] || !uniform[X2DIR] || !uniform[X3DIR]) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in Reconstruction constructor" << std::endl
+          << "WENO5/WENO5Z requires uniform spacing in all directions"
+          << " (x1rat = x2rat = x3rat = 1.0)" << std::endl;
+      ATHENA_ERROR(msg);
+    }
+  }
+
   // Uniform mesh with --coord=cartesian or GR: Minkowski, Schwarzschild, Kerr-Schild,
   // GR-User will use the uniform Cartesian limiter and reconstruction weights
   // TODO(c-white): use modified version of curvilinear PPM reconstruction weights and
@@ -694,6 +708,142 @@ Reconstruction::Reconstruction(MeshBlock *pmb, ParameterInput *pin) :
     }
     delete[] beta;
   } // end "if PPM or full 4th order spatial integrator"
+
+  // ==========================================================================
+  // Non-uniform CS5 reconstruction weights (radial direction only).
+  //
+  // Activates iff x1rat != 1.0.  Computes two sets of 5 weights per face:
+  //   cs5_wp_s{0..4}_i(i) : weights for the LF-split "+ stencil" at face x1f(i),
+  //                        using stencil cells {i-3, i-2, i-1, i, i+1}.
+  //   cs5_wm_s{0..4}_i(i) : weights for the "- stencil", cells {i-2..i+2},
+  //                        STORED REVERSED so the runtime can apply them to
+  //                        the existing flux_stencil_m[s] = flx_stencil[5-s]
+  //                        without re-indexing.
+  //
+  // Algorithm: solve the 5x5 Vandermonde system β^T · w = v with
+  //   β[s,n] = (1/Δr_s) ∫_{cell s} (r - r_c)^n dr,    v[n] = (r_face - r_c)^n
+  // using r_c = r_face for good conditioning at large r (a small improvement
+  // over the existing PPM Vandermonde which uses r_c = 0 — see TODO note at
+  // line ~365 about FP precision difficulties).  With r_c = r_face we get
+  // v = (1, 0, 0, 0, 0) and matrix entries are O(Δr^n).
+  //
+  // Verified bit-identical to (2, -13, 47, 27, -3)/60 in the uniform limit
+  // (vis/python/verify_cs5_nonuniform.py, Test 1 & Test 8).
+  // ==========================================================================
+  cs5_use_nonuniform_i = (pmb->block_size.x1rat != 1.0);
+  if (cs5_use_nonuniform_i) {
+    // Locally-scoped pco — this block is OUTSIDE the "if (order_flag==3||4)"
+    // block (where the existing PPM init declares pco) because CS5 weights
+    // are needed independently of the LO xorder (e.g., for EFL with
+    // xorder=weno5z LO + xorder_HO=cs5 HO).
+    Coordinates *pco = pmb->pcoord;
+    const int nc1 = pmb->ncells1;
+    cs5_wp_s0_i.NewAthenaArray(nc1);
+    cs5_wp_s1_i.NewAthenaArray(nc1);
+    cs5_wp_s2_i.NewAthenaArray(nc1);
+    cs5_wp_s3_i.NewAthenaArray(nc1);
+    cs5_wp_s4_i.NewAthenaArray(nc1);
+    cs5_wm_s0_i.NewAthenaArray(nc1);
+    cs5_wm_s1_i.NewAthenaArray(nc1);
+    cs5_wm_s2_i.NewAthenaArray(nc1);
+    cs5_wm_s3_i.NewAthenaArray(nc1);
+    cs5_wm_s4_i.NewAthenaArray(nc1);
+
+    constexpr int N = 5;  // CS5 stencil size
+    // Allocate 5x5 matrix for LU decompose (heap, matches PPM idiom)
+    Real **beta_cs5 = new Real*[N];
+    for (int row = 0; row < N; ++row) {
+      beta_cs5[row] = new Real[N];
+    }
+    Real b_rhs[N], w_sol[N];
+    int permute[N];
+
+    // Lambda: build β matrix for stencil with cell-left-face offsets s_off
+    // (s_off = -3 for + stencil, s_off = -2 for - stencil) and solve.
+    auto compute_weights = [&](int i, int s_off, Real w_out[N]) -> bool {
+      const Real r_face = pco->x1f(i);  // face index i corresponds to x1f(i)
+      // RHS in r_c-shifted basis: v[n] = (r_face - r_c)^n with r_c = r_face
+      // => v = (1, 0, 0, 0, 0)
+      b_rhs[0] = 1.0;
+      for (int n = 1; n < N; ++n) b_rhs[n] = 0.0;
+
+      for (int col = 0; col < N; ++col) {
+        // col indexes the STENCIL CELL (s).
+        // Cell col occupies [x1f(i + s_off + col), x1f(i + s_off + col + 1)].
+        // Shift to r_c-frame:
+        const Real r_lo = pco->x1f(i + s_off + col)     - r_face;
+        const Real r_hi = pco->x1f(i + s_off + col + 1) - r_face;
+        const Real dr   = r_hi - r_lo;
+        for (int row = 0; row < N; ++row) {
+          // row indexes the POLYNOMIAL DEGREE (n).
+          // Mignone Eq. 16/23 with m_coord = 0 (Cartesian Jacobian = 1):
+          //   β[s,n] = (1/(n+1)) × (r_hi^(n+1) - r_lo^(n+1)) / Δr
+          //
+          // Want to solve β^T · w = v.  DoolittleLUPSolve solves M·x = b
+          // natively (M[i][j] = M_{ij} in standard C convention), so we need
+          // to STORE the transpose, i.e., M = β^T means
+          //   M[i=row=n][j=col=s] = β^T_{n,s} = β_{s,n}
+          // Hence the index order [row][col] below — note this differs from
+          // a naive [col][row]=β_{s,n} (which would store β, not β^T, and
+          // solve the WRONG system β·x=v).  This convention matches PPM
+          // at line ~370 (where PPM uses col=n, row=cell — opposite labelling
+          // but same effective transposed storage).
+          const int n = row;
+          beta_cs5[row][col] =
+              (std::pow(r_hi, n + 1) - std::pow(r_lo, n + 1)) / ((n + 1) * dr);
+        }
+      }
+      if (!DoolittleLUPDecompose(beta_cs5, N, permute)) {
+        return false;
+      }
+      DoolittleLUPSolve(beta_cs5, permute, b_rhs, N, w_sol);
+      for (int s = 0; s < N; ++s) w_out[s] = w_sol[s];
+      return true;
+    };
+
+    // Loop over interior faces with full 5-cell stencils available.
+    // + stencil needs i-3..i+1, - stencil needs i-2..i+2 → safe range:
+    //   i_min = is - NGHOST + 3   (so i-3 >= is-NGHOST)
+    //   i_max = ie + NGHOST - 2   (so i+2 <= ie+NGHOST)
+    const int i_min = (pmb->is) - NGHOST + 3;
+    const int i_max = (pmb->ie) + NGHOST - 2;
+    for (int i = i_min; i <= i_max; ++i) {
+      Real w_p[N], w_m_nat[N];
+
+      // + stencil: cells {i-3, i-2, i-1, i, i+1}; offset s_off = -3
+      if (!compute_weights(i, -3, w_p)) {
+        std::stringstream msg;
+        msg << "### FATAL ERROR in Reconstruction constructor" << std::endl
+            << "Non-uniform CS5: LU decompose failed (+ stencil) at i=" << i
+            << " (x1rat=" << pmb->block_size.x1rat << ", nx1="
+            << pmb->block_size.nx1 << ")" << std::endl;
+        ATHENA_ERROR(msg);
+      }
+      cs5_wp_s0_i(i) = w_p[0];
+      cs5_wp_s1_i(i) = w_p[1];
+      cs5_wp_s2_i(i) = w_p[2];
+      cs5_wp_s3_i(i) = w_p[3];
+      cs5_wp_s4_i(i) = w_p[4];
+
+      // - stencil: cells {i-2, i-1, i, i+1, i+2}; offset s_off = -2
+      // Store REVERSED to pair with flux_stencil_m[s] = flx_stencil[5-s]
+      if (!compute_weights(i, -2, w_m_nat)) {
+        std::stringstream msg;
+        msg << "### FATAL ERROR in Reconstruction constructor" << std::endl
+            << "Non-uniform CS5: LU decompose failed (- stencil) at i=" << i
+            << std::endl;
+        ATHENA_ERROR(msg);
+      }
+      cs5_wm_s0_i(i) = w_m_nat[4];
+      cs5_wm_s1_i(i) = w_m_nat[3];
+      cs5_wm_s2_i(i) = w_m_nat[2];
+      cs5_wm_s3_i(i) = w_m_nat[1];
+      cs5_wm_s4_i(i) = w_m_nat[0];
+    }
+
+    for (int i = 0; i < N; ++i) delete[] beta_cs5[i];
+    delete[] beta_cs5;
+  } // end non-uniform CS5 init
 }
 
 

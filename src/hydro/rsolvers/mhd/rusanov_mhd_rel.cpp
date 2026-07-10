@@ -17,6 +17,7 @@
 #include "../../../coordinates/coordinates.hpp"
 #include "../../../field/field.hpp"
 #include "../../../mesh/mesh.hpp"
+#include "../../../reconstruct/reconstruction.hpp"  // for Reconstruction::cs5_wp_s*_i / cs5_use_nonuniform_i (non-uniform CS5)
 
 using namespace characterisiticfields::rmhd;
 
@@ -194,6 +195,38 @@ void RusanovFluxDir(Hydro *ph,
         }
 #endif
 #endif
+        // Stencil-wide b² gate: HO recon uses 6 cells along ivx; if ANY
+        // has cell-centered B² ≤ ho_b2_stencil_min, the CS5/WENO smoothness
+        // assumption breaks for B and the HO output can poison the EFL
+        // blend.  Lab-frame B² is a conservative proxy (B²=0 ⇒ b²=0).
+        // Default 0.0 → check is skipped (bit-identical to legacy).
+        // Stricter than the face-avg b² gate (which checks only L+R).
+        // EFL-only: in non-EFL mode (allow_local_invalid=false) there is
+        // no external LO solver to defer to, so the gate is skipped.
+        if (ph->ho_b2_stencil_min_ > 0.0 && allow_local_invalid) {
+          const Real b2_stencil_min = ph->ho_b2_stencil_min_;
+          bool stencil_field_ok = true;
+          for (int s = -3; s <= 2; ++s) {
+            int kk = k, jj = j, ii = i;
+            switch (ivx) {
+              case IVX: ii = i + s; break;
+              case IVY: jj = j + s; break;
+              default:  kk = k + s; break;
+            }
+            const Real Bsq = SQR(bcc(IB1, kk, jj, ii))
+                           + SQR(bcc(IB2, kk, jj, ii))
+                           + SQR(bcc(IB3, kk, jj, ii));
+            if (Bsq <= b2_stencil_min) {
+              stencil_field_ok = false;
+              break;
+            }
+          }
+          if (!stencil_field_ok) {
+            MarkInvalidFace(k, j, i, flux_dir, emf_t1, emf_t2);
+            continue;
+          }
+        }
+
         RMHDState avg_state{};
         Real lambda_avg[NRMHD] = {};
         Real L_eig[NRMHD][NRMHD] = {};
@@ -257,7 +290,25 @@ void RusanovFluxDir(Hydro *ph,
         const bool bn_gate_pass =
             !ph->ho_bn_gate_enable_ || (SQR(avg_state.Bn) > ph->ho_bn_min_eig_);
 
-        if (sigma < 1.0e4 && b2_gate_pass && bn_gate_pass) {
+        // HO reconstruction mode routing:
+        //   COMPONENTWISE — skip Anton eigsys entirely; go straight to the
+        //                   componentwise Tier-2 flux (Guercilena+17 §2.2 Eq. 7)
+        //                   below.  Saves ~40% of per-face HO cost by not
+        //                   computing the eigenvector matrices.
+        //   AUTO          — try Anton characteristic; on eig_ok=false fall
+        //                   through to componentwise Tier-2.  In auto mode the
+        //                   Anton L·R tolerance in GetLeftEigenVectorSRMHD is
+        //                   already tightened to 1e-6 (via the strict-fallback
+        //                   flag propagated at Hydro init), so eig_ok=false
+        //                   faithfully reports faces where Tier-1 would produce
+        //                   a bad L → route them to Tier-2 instead of LO.
+        //   CHARACTERISTIC — legacy path, bit-identical: run eigsys, on
+        //                   eig_ok=false take the existing LO/MarkInvalid/FATAL
+        //                   fallback.
+        const int recon_mode = ph->ho_recon_mode_;
+        const bool skip_eigsys = (recon_mode == HO_MODE_COMPONENTWISE);
+
+        if (!skip_eigsys && sigma < 1.0e4 && b2_gate_pass && bn_gate_pass) {
           // In tetrad frame (GR) or lab frame (SR) the eigensystem is identical
           // — avg_state is already in SR form in both cases.
           GetEigenValuesSRMHD(avg_state, lambda_avg);
@@ -289,8 +340,9 @@ void RusanovFluxDir(Hydro *ph,
             ++ph->lr_off_bins_ [bin_idx(summary.max_offdiag)];
           }
 #endif
-        } else {
-          // Complete eigensystem failure — use low-order Rusanov fallback
+        } else if (recon_mode == HO_MODE_CHARACTERISTIC) {
+          // eig_ok=false in CHARACTERISTIC mode — legacy LO fallback path
+          // (bit-identical to pre-2026-07 behavior).
 #if EFL_DEBUG
           ++ph->ho_hard_fail_;
 #endif
@@ -323,14 +375,16 @@ void RusanovFluxDir(Hydro *ph,
           // SR LO Rusanov fallback disabled — the EFL scheme's MarkInvalidFace
           // path (allow_local_invalid branch above) is how we handle eigen-
           // system failures now. If a user runs non-EFL SR and hits eigensystem
-          // failure, error out loudly rather than silently fall back.
+          // failure in CHARACTERISTIC mode, error out loudly rather than
+          // silently fall back. (Users hitting this should switch to
+          // ho_recon_mode=auto so componentwise Tier-2 catches it instead.)
           {
             std::stringstream msg;
             msg << "### FATAL ERROR in Hydro::RusanovFlux (SR)" << std::endl
-                << "HO eigensystem failed (sigma>=1e4 or solver fail) but the "
-                << "SR LO Rusanov fallback has been disabled. Run with EFL "
-                << "enabled (hydro/efl_enable=true) so failed faces fall back "
-                << "to the external LLF solver, or re-enable the LO fallback."
+                << "HO eigensystem failed (sigma>=1e4 or solver fail) with "
+                << "ho_recon_mode=characteristic. Switch to ho_recon_mode=auto "
+                << "(default) so the componentwise Tier-2 path handles this "
+                << "face, or enable EFL so MarkInvalidFace routes to LLF."
                 << std::endl;
             ATHENA_ERROR(msg);
           }
@@ -350,6 +404,115 @@ void RusanovFluxDir(Hydro *ph,
 #endif
 
           continue; // Exit after fallback - don't run characteristic reconstruction
+        } else {
+          // eig_ok=false OR skip_eigsys — AUTO / COMPONENTWISE Tier-2 path.
+          // Guercilena+17 §2.2 Eq. 7 componentwise LF split: no eigsys, no
+          // characteristic projection.  For AUTO mode this catches Anton
+          // ill-conditioning without the LO diffusion penalty.
+#if EFL_DEBUG
+          if (recon_mode == HO_MODE_AUTO && !skip_eigsys) {
+            ++ph->ho_hard_fail_;
+            ++ph->ho_tier1_reject_;
+          }
+#endif
+#if !GENERAL_RELATIVITY
+          // SR path: the eigsys success branch would have built the stencil
+          // AFTER eig_ok — but Tier-2 also needs it, so build it here.
+          // GR path pre-built the stencil during the tetrad transform (above).
+          BuildFaceCompatibleStencilDataSRMHD(
+              k, j, i, ivx, u_red, f_red, lambda,
+              cons_stencil, flx_stencil, lambda_stencil);
+#endif
+          GetMaximalWaveSpeedStencilSRMHD(lambda_stencil, lambda_max);
+
+          // Componentwise LF uses a SCALAR κ = max over all 7 wave speeds
+          // across the stencil (vs. per-wave λ_max in the characteristic path).
+          // Slightly more diffusive but guaranteed finite for finite input.
+          Real amax_scalar = 0.0;
+          for (int m = 0; m < NRMHD; ++m) {
+            if (lambda_max[m] > amax_scalar) amax_scalar = lambda_max[m];
+          }
+
+          // Non-uniform CS5 weight fetch (identical logic to Tier-1 block).
+          const Real *cs5_wp_face_t2 = nullptr;
+          const Real *cs5_wm_face_t2 = nullptr;
+          Real cs5_wp_buf_t2[5], cs5_wm_buf_t2[5];
+          if (ivx == IVX && pmb->precon->cs5_use_nonuniform_i
+              && ho_recon_kind == HO_RECON_CS5) {
+            cs5_wp_buf_t2[0] = pmb->precon->cs5_wp_s0_i(i);
+            cs5_wp_buf_t2[1] = pmb->precon->cs5_wp_s1_i(i);
+            cs5_wp_buf_t2[2] = pmb->precon->cs5_wp_s2_i(i);
+            cs5_wp_buf_t2[3] = pmb->precon->cs5_wp_s3_i(i);
+            cs5_wp_buf_t2[4] = pmb->precon->cs5_wp_s4_i(i);
+            cs5_wm_buf_t2[0] = pmb->precon->cs5_wm_s0_i(i);
+            cs5_wm_buf_t2[1] = pmb->precon->cs5_wm_s1_i(i);
+            cs5_wm_buf_t2[2] = pmb->precon->cs5_wm_s2_i(i);
+            cs5_wm_buf_t2[3] = pmb->precon->cs5_wm_s3_i(i);
+            cs5_wm_buf_t2[4] = pmb->precon->cs5_wm_s4_i(i);
+            cs5_wp_face_t2 = cs5_wp_buf_t2;
+            cs5_wm_face_t2 = cs5_wm_buf_t2;
+          }
+
+          ReconComponentwiseFluxStencilSRMHD(
+              flx_stencil, cons_stencil, amax_scalar, rflx_face,
+              ho_recon_kind, cs5_wp_face_t2, cs5_wm_face_t2);
+
+          WriteReducedFlux(rflx_face, k, j, i, ivx, flux_dir);
+          WriteReducedEMF (rflx_face, k, j, i, emf_t1, emf_t2);
+
+#if GENERAL_RELATIVITY
+          CallFluxToGlobalSingle(pmb, k, j, i, ivx, tetrad_cons, tetrad_bbx,
+                                 flux_dir, emf_t1, emf_t2);
+#endif
+
+          // Tier-2 is guaranteed finite for finite input; still guard against
+          // upstream NaN in the stencil (e.g. rare user-BC edge cases).
+          bool t2_flux_ok = std::isfinite(emf_t1(k, j, i))
+                         && std::isfinite(emf_t2(k, j, i));
+          for (int n = 0; n < NHYDRO; ++n) {
+            t2_flux_ok = t2_flux_ok && std::isfinite(flux_dir(n, k, j, i));
+          }
+          if (!t2_flux_ok) {
+            if (allow_local_invalid) {
+              MarkInvalidFace(k, j, i, flux_dir, emf_t1, emf_t2);
+              continue;
+            }
+            std::stringstream msg;
+            msg << "### FATAL ERROR in Hydro::RusanovFlux (Tier-2)" << std::endl
+                << "Componentwise LF produced non-finite flux at "
+                << DirLabel(ivx) << " interface (i=" << i << ", j=" << j
+                << ", k=" << k << ")" << std::endl
+                << "time=" << pmb->pmy_mesh->time << std::endl;
+            ATHENA_ERROR(msg);
+          }
+
+#if EFL_DEBUG
+          ++ph->ho_tier2_calls_;
+#endif
+
+          // Tier-2 CT weight tracking (same as Tier-1 block below).
+          if (track_wct) {
+            Real rho_l = 0.0;
+            Real rho_r = 0.0;
+            switch (ivx) {
+              case IVX:
+                rho_l = prim(IDN, k, j, i - 1);
+                rho_r = prim(IDN, k, j, i);
+                break;
+              case IVY:
+                rho_l = prim(IDN, k, j - 1, i);
+                rho_r = prim(IDN, k, j, i);
+                break;
+              default:
+                rho_l = prim(IDN, k - 1, j, i);
+                rho_r = prim(IDN, k, j, i);
+                break;
+            }
+            (*wct_dir)(k, j, i) =
+                ph->GetWeightForCT(flux_dir(IDN, k, j, i), rho_l, rho_r,
+                                   dxw_face(i), pmb->pmy_mesh->dt);
+          }
+          continue;  // Tier-2 done for this face; skip the Tier-1 recon below.
         }
 
         // Only run characteristic reconstruction if eigensystem was successful.
@@ -361,8 +524,32 @@ void RusanovFluxDir(Hydro *ph,
             cons_stencil, flx_stencil, lambda_stencil);
 #endif
         GetMaximalWaveSpeedStencilSRMHD(lambda_stencil, lambda_max);
+
+        // Non-uniform CS5 path: when active and reconstructing in the radial
+        // direction, fetch per-face Mignone-2014 Vandermonde weights from the
+        // Reconstruction class.  Otherwise pass nullptr → uniform textbook
+        // (2,-13,47,27,-3)/60 inside ReconstructScalarHO.
+        const Real *cs5_wp_face = nullptr;
+        const Real *cs5_wm_face = nullptr;
+        Real cs5_wp_buf[5], cs5_wm_buf[5];
+        if (ivx == IVX && pmb->precon->cs5_use_nonuniform_i
+            && ho_recon_kind == HO_RECON_CS5) {
+          cs5_wp_buf[0] = pmb->precon->cs5_wp_s0_i(i);
+          cs5_wp_buf[1] = pmb->precon->cs5_wp_s1_i(i);
+          cs5_wp_buf[2] = pmb->precon->cs5_wp_s2_i(i);
+          cs5_wp_buf[3] = pmb->precon->cs5_wp_s3_i(i);
+          cs5_wp_buf[4] = pmb->precon->cs5_wp_s4_i(i);
+          cs5_wm_buf[0] = pmb->precon->cs5_wm_s0_i(i);
+          cs5_wm_buf[1] = pmb->precon->cs5_wm_s1_i(i);
+          cs5_wm_buf[2] = pmb->precon->cs5_wm_s2_i(i);
+          cs5_wm_buf[3] = pmb->precon->cs5_wm_s3_i(i);
+          cs5_wm_buf[4] = pmb->precon->cs5_wm_s4_i(i);
+          cs5_wp_face = cs5_wp_buf;
+          cs5_wm_face = cs5_wm_buf;
+        }
         ReconCharFieldsStencilSRMHD(flx_stencil, cons_stencil, lambda_max,
-                                    L_eig, char_flx, ho_recon_kind);
+                                    L_eig, char_flx, ho_recon_kind,
+                                    cs5_wp_face, cs5_wm_face);
         ReconFluxRMHD(k, j, i, ivx, char_flx, R_eig, flux_dir, emf_t1, emf_t2);
 
 #if GENERAL_RELATIVITY
@@ -391,6 +578,12 @@ void RusanovFluxDir(Hydro *ph,
               << "time=" << pmb->pmy_mesh->time << std::endl;
           ATHENA_ERROR(msg);
         }
+#if EFL_DEBUG
+        // Tier-1 (characteristic) success — reached only when eig_ok and the
+        // finite check passed.  The Tier-2 (componentwise) branch increments
+        // ho_tier2_calls_ in its own success block above.
+        ++ph->ho_tier1_calls_;
+#endif
 
         if (track_wct) {
           Real rho_l = 0.0;
@@ -449,6 +642,9 @@ void Hydro::RusanovFlux(AthenaArray<Real> &prim,
     ho_counter_cycle_ = pmb->pmy_mesh->ncycle;
     ho_eig_calls_ = 0;
     ho_hard_fail_ = 0;
+    ho_tier1_calls_ = 0;
+    ho_tier2_calls_ = 0;
+    ho_tier1_reject_ = 0;
     ho_hybridized_ = 0;
     ho_pure_ho_ = 0;
     for (int b = 0; b < 5; ++b) {
@@ -493,6 +689,9 @@ void Hydro::RusanovFlux(AthenaArray<Real> &prim,
     ho_counter_cycle_ = pmb->pmy_mesh->ncycle;
     ho_eig_calls_ = 0;
     ho_hard_fail_ = 0;
+    ho_tier1_calls_ = 0;
+    ho_tier2_calls_ = 0;
+    ho_tier1_reject_ = 0;
     ho_hybridized_ = 0;
     ho_pure_ho_ = 0;
     for (int b = 0; b < 5; ++b) {

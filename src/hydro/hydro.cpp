@@ -92,11 +92,55 @@ Hydro::Hydro(MeshBlock *pmb, ParameterInput *pin) :
   ho_b2_min_eig_ = pin->GetOrAddReal("hydro", "ho_b2_min_eig", 0.0);
   ho_bn_min_eig_ = pin->GetOrAddReal("hydro", "ho_bn_min_eig", 0.0);
   // Master on/off toggles.  When false, the corresponding threshold check
-  // is bypassed entirely (HO runs regardless of avg.bsq or Bn²).  Default
-  // true preserves legacy behaviour.
-  ho_b2_gate_enable_ = pin->GetOrAddBoolean("hydro", "ho_b2_gate_enable", true);
-  ho_bn_gate_enable_ = pin->GetOrAddBoolean("hydro", "ho_bn_gate_enable", true);
+  // is bypassed entirely (HO runs regardless of avg.bsq or Bn²).
+  // Defaults changed to false: SRMHD test suite (shock tubes, CPAW) needs
+  // HO to run at B=0 regions.  GRMHD FM-torus decks that want the guard
+  // set these true explicitly (see athinput.fm_torus_porth19_prod_efl*
+  // and athinput.fm_torus_native_efl*).  Antón's Type-I degeneracy
+  // handling covers Bn → 0 internally, so ho_bn_gate is redundant unless
+  // stress-testing extreme states.
+  ho_b2_gate_enable_ = pin->GetOrAddBoolean("hydro", "ho_b2_gate_enable", false);
+  ho_bn_gate_enable_ = pin->GetOrAddBoolean("hydro", "ho_bn_gate_enable", false);
+  // Stencil-wide b² gate: see hydro.hpp comment.  Default 0.0 = off.
+  // Recommended when active: same order as ho_b2_min_eig_ (e.g. 1e-12)
+  // since it checks the SAME physical quantity (B²) across more cells.
+  ho_b2_stencil_min_ = pin->GetOrAddReal("hydro", "ho_b2_stencil_min", 0.0);
 
+  // HO reconstruction mode selector.  See hydro.hpp comment for semantics.
+  //   auto           — Anton characteristic with fall-through to componentwise
+  //                    when the strict L·R check rejects the eigsys result.
+  //   characteristic — force Anton characteristic (bit-identical legacy).
+  //   componentwise  — force components split (Guercilena+17 §2.2 Eq. 7).
+  const std::string ho_mode_str =
+      pin->GetOrAddString("hydro", "ho_recon_mode", "auto");
+  if (ho_mode_str == "auto") {
+    ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_AUTO;
+  } else if (ho_mode_str == "characteristic") {
+    ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_CHARACTERISTIC;
+  } else if (ho_mode_str == "componentwise") {
+    ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_COMPONENTWISE;
+  } else {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in Hydro constructor" << std::endl
+        << "Unsupported hydro/ho_recon_mode='" << ho_mode_str
+        << "'. Valid: auto, characteristic, componentwise." << std::endl;
+    ATHENA_ERROR(msg);
+  }
+
+  // Strict biorthogonality check on the InvertMatrixRMHD fallback path.
+  // Default false = bit-identical legacy behavior (fallback accepts L
+  // unconditionally on linear-solve success).  True = check L·R against
+  // the same adaptive tolerance used in GetLeftEigenVectorSRMHD; on
+  // failure the eigsys hard-fails and the caller (in ho_recon_mode=auto)
+  // routes to the componentwise Tier-2 path.  Auto-forced on when
+  // ho_recon_mode=auto so the fallback path is always validated.
+  ho_strict_fallback_check_ =
+      pin->GetOrAddBoolean("hydro", "ho_strict_fallback_check", false);
+  if (ho_recon_mode_ == characterisiticfields::rmhd::HO_MODE_AUTO) {
+    ho_strict_fallback_check_ = true;
+  }
+  characterisiticfields::rmhd::SetStrictFallbackCheckSRMHD(
+      ho_strict_fallback_check_);
 
 #if EFL_ENABLED
   efl_enabled = pin->GetOrAddBoolean("hydro", "efl_enable", false);

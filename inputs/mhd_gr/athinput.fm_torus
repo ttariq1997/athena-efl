@@ -4,7 +4,7 @@ reference = Fishbone & Moncrief 1976, ApJ 207 962
 configure = -g -b --prob gr_torus --coord=kerr-schild --flux hlle --nghost 4 -hdf5
 
 <job>
-problem_id = fm_torus  # problem ID: base name of output files
+problem_id = fm_torus_HLLE  # problem ID: base name of output files
 
 <time>
 cfl_number = 0.3  # factor multiplying shortest cell crossing time
@@ -47,6 +47,7 @@ nx1    = 64                  # number of cells
 x1min  = 1.7811841172555203  # minimum
 x1max  = 35.0                # maximum
 x1rat  = 1.0476319576931545  # ratio of adjacent widths
+#x1rat  = 1.0 # ratio of adjacent widths
 ix1_bc = user                # inner boundary
 ox1_bc = user                # outer boundary
 
@@ -69,9 +70,9 @@ ox3_bc = periodic            # counterclockwise boundary
 refinement = none
 
 <meshblock>
-nx1 = 64  # block size in r-direction
-nx2 = 64  # block size in theta-direction
-nx3 = 64  # block size in phi-direction
+nx1 = 32  # block size in r-direction
+nx2 = 32  # block size in theta-direction
+nx3 = 32  # block size in phi-direction
 
 <refinement1>
 level = 1                   # refinement level relative to root (0)

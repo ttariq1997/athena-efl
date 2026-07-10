@@ -35,7 +35,27 @@ enum HOReconKindRMHD {
   HO_RECON_CS5 = 2
 };
 
-inline Real ReconstructScalarHO(const Real char_flx[5], const int rec_kind) {
+// HO reconstruction mode selector (hydro/ho_recon_mode input knob).
+// Controls whether the LF flux splitting Guercilena+17 Eq. 7 is applied in
+// characteristic space (Anton eigsys) or componentwise on the physical fluxes.
+//   AUTO           — attempt characteristic; if strict L·R check fails, fall
+//                    through to componentwise (default; safest).
+//   CHARACTERISTIC — force characteristic path (bit-identical to legacy code).
+//   COMPONENTWISE  — force componentwise path (skip eigsys entirely; use when
+//                    Anton eigenvectors are ill-conditioned, e.g. SR-MHD rotor).
+constexpr int HO_MODE_AUTO           = 0;
+constexpr int HO_MODE_CHARACTERISTIC = 1;
+constexpr int HO_MODE_COMPONENTWISE  = 2;
+
+// Optional cs5_w[5] argument: per-face CS5 weights for non-uniform grids
+// (Mignone 2014 Vandermonde).  When non-null, cs5_w is used IN PLACE of the
+// textbook (2,-13,47,27,-3)/60 in the HO_RECON_CS5 branch.  Default nullptr
+// preserves the existing uniform-grid behavior — all existing callers that
+// pass only 2 arguments automatically get the textbook path.
+// WENO5/WENO5Z paths ignore cs5_w (those schemes need their own non-uniform
+// extension, not in scope for this work).
+inline Real ReconstructScalarHO(const Real char_flx[5], const int rec_kind,
+                                 const Real *cs5_w = nullptr) {
   constexpr Real optimw[3] = {1.0/10.0, 3.0/5.0, 3.0/10.0};
   constexpr Real epsl = constants::EPSILON_SMALL;
   constexpr Real othreeotwo = 13.0/12.0;
@@ -45,6 +65,11 @@ inline Real ReconstructScalarHO(const Real char_flx[5], const int rec_kind) {
   const Real fi   = char_flx[2];
   const Real fimo = char_flx[1];
   const Real fimt = char_flx[0];
+
+  if (rec_kind == HO_RECON_CS5 && cs5_w != nullptr) {
+    return cs5_w[0]*fimt + cs5_w[1]*fimo + cs5_w[2]*fi
+         + cs5_w[3]*fipo + cs5_w[4]*fipt;
+  }
 
   if (rec_kind == HO_RECON_CS5) {
     return (2.0 * fimt - 13.0 * fimo + 47.0 * fi + 27.0 * fipo - 3.0 * fipt) / 60.0;
@@ -196,6 +221,27 @@ inline void SetLastEigenFailureSRMHD(
     const int /*code*/,
     const Real metric = std::numeric_limits<Real>::quiet_NaN()) {
   LastEigenFailureMetricSRMHD() = metric;
+}
+
+// Opt-in strict biorthogonality check for the InvertMatrixRMHD fallback path
+// in GetEigenVectorSRMHD. Default OFF preserves legacy behavior (bit-identical
+// to pre-2026-07 code): if the linear solve succeeds we accept L unconditionally.
+// Turn ON (`hydro/ho_strict_fallback_check = true`) when hunting Anton eigsys
+// pathologies — pays an extra 7×7 matmul + max-scan (~350 ops) only on the
+// rare code path where the analytic left construction has already failed.
+//
+// NOT thread_local (unlike LastEigenFailureMetricSRMHD above): this is a
+// once-at-init configuration read by every OpenMP worker running the eigsys.
+// std::atomic with relaxed order — set-once, read-many, no ordering constraint.
+inline std::atomic<bool> &StrictFallbackCheckFlagSRMHD() {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
+inline void SetStrictFallbackCheckSRMHD(const bool on) {
+  StrictFallbackCheckFlagSRMHD().store(on, std::memory_order_relaxed);
+}
+inline bool GetStrictFallbackCheckSRMHD() {
+  return StrictFallbackCheckFlagSRMHD().load(std::memory_order_relaxed);
 }
 
 // Forward declarations for functions that have callers preceding their definitions.
@@ -910,12 +956,25 @@ inline void GetMaximalWaveSpeedStencilSRMHD(const Real lambda_stencil[6][NRMHD],
 // 2. Apply WENO5/WENO5Z reconstruction to each characteristic field
 // 3. Combine left/right going waves: char_flux = flux^+ + flux^-
 // 4. Transform back to physical space later: F = R · char_flux
+// Optional cs5_wp[5] / cs5_wm[5]: per-face CS5 weights for non-uniform grids
+// (Mignone 2014 Vandermonde, see Reconstruction class members cs5_wp_s*_i,
+// cs5_wm_s*_i).  Pass nullptr (default) to use the textbook CS5 weights —
+// preserves existing uniform-grid behavior for all callers that don't supply
+// the optional arguments.
+//
+// When ho_recon_kind == HO_RECON_CS5 and the weights are supplied:
+//   - cs5_wp applies natural-order to flux_stencil_p (cells {i-3..i+1})
+//   - cs5_wm applies natural-order to flux_stencil_m which is REVERSED in
+//     this code (flx_stencil[5-s]).  cs5_wm is STORED pre-reversed by the
+//     init code so the dot-product just works.
 inline void ReconCharFieldsStencilSRMHD(const Real flx_stencil[6][NRMHD],
                                         const Real cons_stencil[6][NRMHD],
                                         const Real lambda_max[NRMHD],
                                         const Real (&L_eig)[NRMHD][NRMHD],
                                         Real char_flx[NRMHD],
-                                        const int ho_recon_kind) {
+                                        const int ho_recon_kind,
+                                        const Real *cs5_wp = nullptr,
+                                        const Real *cs5_wm = nullptr) {
   constexpr Real fac = 0.5;  // Factor for local Lax-Friedrichs splitting
 
   // Loop over each characteristic field (7 waves in SRMHD)
@@ -937,9 +996,49 @@ inline void ReconCharFieldsStencilSRMHD(const Real flx_stencil[6][NRMHD],
       }
     }
 
-    // Apply high-order reconstruction (WENO5/WENO5Z) and combine
-    char_flx[m] = ReconstructScalarHO(flux_stencil_p, ho_recon_kind)
-                + ReconstructScalarHO(flux_stencil_m, ho_recon_kind);
+    // Apply high-order reconstruction (WENO5/WENO5Z/CS5) and combine
+    char_flx[m] = ReconstructScalarHO(flux_stencil_p, ho_recon_kind, cs5_wp)
+                + ReconstructScalarHO(flux_stencil_m, ho_recon_kind, cs5_wm);
+  }
+}
+
+// Componentwise Lax-Friedrichs HO reconstruction (Guercilena+17 Section 2.2,
+// "components split", Eq. 7):
+//     f±_m := 0.5 · (F_m(U) ± κ · U_m),   κ := max over stencil of wave speeds
+// Applied to each conserved component m INDEPENDENTLY of the others — no
+// characteristic projection, no Anton eigsys. This is the direct analogue of
+// the SRHD splitting in the EFL paper's reference implementation (WhiskyTHC).
+//
+// Use as a fallback / alternative to ReconCharFieldsStencilSRMHD when the
+// Anton renormalized eigenvectors become ill-conditioned (cond(R) → 10⁸-10¹²
+// in smooth SR-MHD flows — the ρh·a² − b²·G magnetosonic dispersion residual
+// in the covariant→conserved chain amplifies FP noise).
+//
+// The scalar κ = amax_scalar is the max over ALL 7 wave speeds (vs. per-wave
+// λ_max in the characteristic path). This is slightly more diffusive but
+// guaranteed finite for any finite input.
+//
+// cs5_wp / cs5_wm: optional non-uniform CS5 weights (same convention as
+// ReconCharFieldsStencilSRMHD — cs5_wm is stored pre-reversed).
+inline void ReconComponentwiseFluxStencilSRMHD(
+    const Real flx_stencil[6][NRMHD],
+    const Real cons_stencil[6][NRMHD],
+    const Real amax_scalar,
+    Real rflx_face[NRMHD],
+    const int ho_recon_kind,
+    const Real *cs5_wp = nullptr,
+    const Real *cs5_wm = nullptr) {
+  constexpr Real fac = 0.5;
+  for (int m = 0; m < NRMHD; ++m) {
+    Real fp[5], fm[5];
+    for (int s = 0; s < 5; ++s) {
+      const int sp = s;
+      const int sm = 5 - s;
+      fp[s] = fac * (flx_stencil[sp][m] + amax_scalar * cons_stencil[sp][m]);
+      fm[s] = fac * (flx_stencil[sm][m] - amax_scalar * cons_stencil[sm][m]);
+    }
+    rflx_face[m] = ReconstructScalarHO(fp, ho_recon_kind, cs5_wp)
+                 + ReconstructScalarHO(fm, ho_recon_kind, cs5_wm);
   }
 }
 
@@ -2007,10 +2106,17 @@ inline bool GetLeftEigenVectorSRMHD(const RMHDState &avg,
   // At Type I degeneracy (Bn=0) with high magnetization, the nearly-degenerate
   // magnetosonic waves produce L·R errors ~O(σ * machine_eps_amplified).
   // The factor (1 + σ + β⁻¹) captures both rest-mass and thermal magnetization.
+  //
+  // Strict-fallback flag (input knob `hydro/ho_strict_fallback_check`, auto-
+  // forced when ho_recon_mode=auto) tightens this to a hard 1e-6 regardless
+  // of magnetization: bad L·R faces are rejected here so the caller can route
+  // to the componentwise Tier-2 path. Zero extra matmul cost — the L·R check
+  // at the bottom of this function is running anyway.
   const Real mag_factor = 1.0 + sigma + beta_inv;
-  const Real kRuntimeOrthoTol = (mag_factor > 10.0)
-      ? std::min(1.0e-2, 1.0e-6 * mag_factor)
-      : 1.0e-6;
+  const Real kRuntimeOrthoTol = GetStrictFallbackCheckSRMHD()
+      ? 1.0e-6
+      : ((mag_factor > 10.0) ? std::min(1.0e-2, 1.0e-6 * mag_factor)
+                             : 1.0e-6);
 
   if (!BuildPaperLeftMatrixSRMHD(avg, lambda, L)) {
     SetLastEigenFailureSRMHD(200);
@@ -2066,11 +2172,40 @@ inline bool GetEigenVectorSRMHD(const RMHDState &avg,
     return true;
   }
 
-  // Left eigenvector construction failed, try matrix inversion as fallback
+  // Left eigenvector construction failed, try matrix inversion as fallback.
+  //
+  // Legacy behavior (default; StrictFallbackCheckFlagSRMHD == false):
+  //   InvertMatrixRMHD success ⇒ accept L unconditionally. Bit-identical to
+  //   pre-2026-07 code. Fast (no extra matmul), but silently accepts garbage L
+  //   when R is ill-conditioned (Anton renormalized eigenvectors in smooth
+  //   SR-MHD flows with high magnetization can drive cond(R) → 10⁸-10¹²).
+  //
+  // Strict fallback (opt-in via hydro/ho_strict_fallback_check = true):
+  //   Additionally require CheckEigenSystemSRMHD(L, R) below the same adaptive
+  //   L·R tolerance used in GetLeftEigenVectorSRMHD. If the check fails, treat
+  //   the fallback as a hard-fail (return false). Callers in HO_MODE_AUTO can
+  //   then route to the componentwise (Tier-2) path instead of using bad L.
+  //   Cost: one 7×7 matmul + max-scan, only paid on this rare code path.
   const Real left_metric = LastEigenFailureMetricSRMHD();
   if (InvertMatrixRMHD(R, L)) {
-    SetLastEigenFailureSRMHD(500, left_metric);
-    return true;
+    if (GetStrictFallbackCheckSRMHD()) {
+      const Real max_lr_err = CheckEigenSystemSRMHD(L, R);
+      const Real sigma_    = (avg.rho > 0.0)  ? avg.bsq / (2.0 * avg.rho) : 0.0;
+      const Real beta_inv_ = (avg.pgas > 0.0) ? 0.5 * avg.bsq / avg.pgas   : 0.0;
+      const Real mag_factor_ = 1.0 + sigma_ + beta_inv_;
+      const Real fallback_tol = (mag_factor_ > 10.0)
+          ? std::min(1.0e-2, 1.0e-6 * mag_factor_)
+          : 1.0e-6;
+      if (std::isfinite(max_lr_err) && max_lr_err < fallback_tol) {
+        SetLastEigenFailureSRMHD(500, left_metric);
+        return true;
+      }
+      SetLastEigenFailureSRMHD(510, max_lr_err);
+      // fall through to hard-fail return below
+    } else {
+      SetLastEigenFailureSRMHD(500, left_metric);
+      return true;
+    }
   }
 
   SetLastEigenFailureSRMHD(520, left_metric);

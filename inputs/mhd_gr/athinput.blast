@@ -3,20 +3,32 @@ problem = GR MHD spherical blast wave
 configure  = --prob=gr_blast -g -b --coord=minkowski
 
 <job>
-problem_id = gr_blast
+problem_id = gr_blast_efl
 
 <output1>
+file_type = hst
+dcycle    = 10
+data_format = %24.16e
+
+<output2>
 file_type = vtk
 variable  = prim
 dt        = 0.1
 
+<output3>
+file_type = vtk
+variable  = efl_x1
+dt        = 0.2
+
 <time>
-cfl_number = 0.4
+cfl_number = 0.25
 nlim       = -1
 tlim       = 1.0
-integrator = vl2  # time integration algorithm
-xorder     = 2    # order of spatial reconstruction
+integrator = rk3  # time integration algorithm
+xorder     = weno5z    # order of spatial reconstruction
 ncycle_out = 1    # interval for stdout summary info
+xorder_HO  = cs5
+
 
 <mesh>
 nx1    = 120       # number of cells in x-direction
@@ -41,6 +53,13 @@ ox3_bc = periodic  # upper boundary
 gamma  = 1.3333333333333333  # ratio of specific heats Gamma
 dfloor = 1.0e-5              # floor on density rho
 pfloor = 1.0e-5              # floor on gas pressure p_gas
+efl_enable = true
+efl_cE     = 1.0
+efl_cmax   = 1.0
+efl_buffer_cycles = 4
+efl_debug_flux_usage = false
+efl_debug_flux_every = 0
+efl_stencil_limiter = true
 
 <problem>
 num_x     = 0    # number of blast centers strictly left and right of central one

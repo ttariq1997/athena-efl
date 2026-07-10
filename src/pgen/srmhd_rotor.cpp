@@ -9,6 +9,13 @@
 //! Reference setup:
 //!   Martí & Müller (2015), Living Reviews in Computational Astrophysics 1:3,
 //!   Section 6.6.2 "The relativistic rotor", summarizing Del Zanna et al. (2003).
+//!
+//! Interface convention:
+//!   `use_smooth_interface=true`  (default): linear ramp of rho and v on
+//!         r in [r_inner, r_outer]. Matches Del Zanna 2003 / B&S 2011 /
+//!         Mignone-Bodo 2006 numerical convention (avoids grid-aligned aliasing).
+//!   `use_smooth_interface=false`:           sharp step at r = r_inner. Matches
+//!         the strict description of Anton et al. 2006 sect 8.2.2.
 //========================================================================================
 
 #include <algorithm>
@@ -39,7 +46,16 @@
 
 namespace {
 
-Real Taper(const Real radius, const Real r_inner, const Real r_outer) {
+// Rotor-interior mass fraction as a function of radius.
+// Returns 1 fully inside the rotor, 0 fully outside, and (when
+// use_smooth_interface = true) a linear ramp on r in [r_inner, r_outer]
+// that avoids grid-aligned aliasing. When use_smooth_interface = false
+// this collapses to a sharp step at r_inner (Anton et al. 2006 sect 8.2.2).
+Real RotorInteriorFraction(const Real radius, const Real r_inner,
+                           const Real r_outer, const bool use_smooth_interface) {
+  if (!use_smooth_interface) {
+    return (radius <= r_inner) ? 1.0 : 0.0;
+  }
   if (radius <= r_inner) return 1.0;
   if (radius >= r_outer) return 0.0;
   return (r_outer - radius) / (r_outer - r_inner);
@@ -77,11 +93,14 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
   const Real bx0 = pin->GetOrAddReal("problem", "bx0", 1.0);
   const Real by0 = pin->GetOrAddReal("problem", "by0", 0.0);
   const Real bz0 = pin->GetOrAddReal("problem", "bz0", 0.0);
+  const bool use_smooth_interface = pin->GetOrAddBoolean(
+      "problem", "use_smooth_interface", true);
 
-  if (r_outer <= r_inner) {
+  if (use_smooth_interface && r_outer <= r_inner) {
     std::stringstream msg;
     msg << "### FATAL ERROR in srmhd_rotor.cpp ProblemGenerator" << std::endl
-        << "Need r_outer > r_inner for the transition layer." << std::endl;
+        << "Need r_outer > r_inner when use_smooth_interface = true "
+        << "(smooth-interface ramp region)." << std::endl;
     ATHENA_ERROR(msg);
   }
   if (omega * r_inner >= 1.0) {
@@ -98,11 +117,12 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
         const Real x = pcoord->x1v(i) - x_center;
         const Real y = pcoord->x2v(j) - y_center;
         const Real radius = std::sqrt(SQR(x) + SQR(y));
-        const Real taper = Taper(radius, r_inner, r_outer);
+        const Real f_in = RotorInteriorFraction(radius, r_inner, r_outer,
+                                                use_smooth_interface);
 
-        const Real rho = rho_ambient + (rho_disk - rho_ambient) * taper;
-        const Real vx = -omega * y * taper;
-        const Real vy =  omega * x * taper;
+        const Real rho = rho_ambient + (rho_disk - rho_ambient) * f_in;
+        const Real vx = -omega * y * f_in;
+        const Real vy =  omega * x * f_in;
         const Real v2 = SQR(vx) + SQR(vy);
         if (v2 >= 1.0) {
           std::stringstream msg;

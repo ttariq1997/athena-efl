@@ -41,7 +41,10 @@ enum HOReconKindRHD {
   HO_RECON_CS5_RHD    = 2
 };
 
-inline Real ReconstructScalarHORHD(const Real char_flx[5], const int rec_kind) {
+// Optional cs5_w[5]: per-face CS5 weights for non-uniform grids
+// (Mignone 2014 Vandermonde).  See SRMHD overload in CharacteristicFieldsRMHD.hpp.
+inline Real ReconstructScalarHORHD(const Real char_flx[5], const int rec_kind,
+                                    const Real *cs5_w = nullptr) {
   constexpr Real optimw[3] = {1.0/10.0, 3.0/5.0, 3.0/10.0};
   constexpr Real epsl = 1.0e-42;  // small denominator floor (matches SRMHD)
   constexpr Real othreeotwo = 13.0/12.0;
@@ -51,6 +54,11 @@ inline Real ReconstructScalarHORHD(const Real char_flx[5], const int rec_kind) {
   const Real fi   = char_flx[2];
   const Real fimo = char_flx[1];
   const Real fimt = char_flx[0];
+
+  if (rec_kind == HO_RECON_CS5_RHD && cs5_w != nullptr) {
+    return cs5_w[0]*fimt + cs5_w[1]*fimo + cs5_w[2]*fi
+         + cs5_w[3]*fipo + cs5_w[4]*fipt;
+  }
 
   if (rec_kind == HO_RECON_CS5_RHD) {
     return (2.0 * fimt - 13.0 * fimo + 47.0 * fi + 27.0 * fipo - 3.0 * fipt) / 60.0;
@@ -679,10 +687,14 @@ inline void GetMaximalWaveSpeedStencilRHD(const Real lambda_stencil[6][NRHD],
 // LF-split characteristic flux from the 6-cell stencil and apply WENO5/WENO5Z/CS5
 // to the +/- branches.  Returns char_flx[m] = upwind characteristic flux at the
 // face.
+// Optional cs5_wp[5] / cs5_wm[5]: per-face CS5 weights for non-uniform grids.
+// See SRMHD analogue in CharacteristicFieldsRMHD.hpp for details.  Default
+// nullptr preserves uniform-grid textbook behavior.
 inline void ReconCharFieldsStencilRHD(
     const Real flx_stencil[6][NRHD], const Real cons_stencil[6][NRHD],
     const Real lambda_max[NRHD], const Real L[NRHD][NRHD],
-    Real char_flx[NRHD], const int rec_kind) {
+    Real char_flx[NRHD], const int rec_kind,
+    const Real *cs5_wp = nullptr, const Real *cs5_wm = nullptr) {
   // Project conservatives and fluxes onto the characteristic basis at the
   // averaged face state: char_q[s][m] = sum_l L[m][l] q_stencil[s][l].
   Real char_q[6][NRHD] = {};
@@ -710,10 +722,10 @@ inline void ReconCharFieldsStencilRHD(
       if (s > 0) fm[s-1] = fns;       // stencil cells i-2..i+2 for -flux (mirrored)
     }
     // f^+ at face uses cells (i-3, i-2, i-1, i, i+1) reading L->R
-    const Real fhat_p = ReconstructScalarHORHD(fp, rec_kind);
+    const Real fhat_p = ReconstructScalarHORHD(fp, rec_kind, cs5_wp);
     // f^- at face uses cells (i+2, i+1, i, i-1, i-2) reading R->L; reverse fm
     Real fm_rev[5] = { fm[4], fm[3], fm[2], fm[1], fm[0] };
-    const Real fhat_m = ReconstructScalarHORHD(fm_rev, rec_kind);
+    const Real fhat_m = ReconstructScalarHORHD(fm_rev, rec_kind, cs5_wm);
     char_flx[m] = fhat_p + fhat_m;
   }
 }

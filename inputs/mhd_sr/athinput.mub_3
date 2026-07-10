@@ -4,24 +4,39 @@ reference = Mignone, Ugliano, & Bodo 2009, MNRAS 393 1141
 configure = --prob=gr_shock_tube -s -b --coord=cartesian
 
 <job>
-problem_id = mhd_shock_rel_3
+problem_id = mhd_shock_rel_3_hlld
 
 <output1>
+file_type = hst
+dcycle    = 10
+data_format = %24.16e
+
+
+<output2>
 file_type   = tab
-variable    = cons
+variable    = prim
 data_format = %24.16e
 dt          = 0.4
+
+#<output3>
+#file_type = tab
+#variable = efl_x1
+#data_format = %24.16e
+#dt =       0.4
 
 <time>
 cfl_number = 0.4
 nlim       = -1
-tlim       = 0.4
+tlim       = 0.42
 integrator  = vl2       # time integration algorithm
 xorder      = 2         # order of spatial reconstruction
 ncycle_out  = 1         # interval for stdout summary info
 
+xorder_HO = cs5
+
+
 <mesh>
-nx1    = 400      # number of cells in x-direction
+nx1    = 800      # number of cells in x-direction
 x1min  = -0.5     # minimum x
 x1max  = 0.5      # maximum x
 ix1_bc = outflow  # left boundary
@@ -41,6 +56,13 @@ ox3_bc = periodic  # upper boundary
 
 <hydro>
 gamma = 1.6666666666666667  # ratio of specific heats Gamma
+
+efl_enable = true
+efl_cE = 1.0
+efl_cmax = 1.0
+efl_buffer_cycles = 4
+efl_debug_flux_usage = false
+efl_debug_flux_every = 0
 
 <problem>
 shock_dir = 1    # 1/2/3 for x/y/z-directions

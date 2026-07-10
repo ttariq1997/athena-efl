@@ -59,8 +59,16 @@ def main(**kwargs):
     else:
         level = None
 
-    # Determine if vector quantities should be read
-    quantities = [kwargs['quantity']]
+    # Composite/derived quantities: extend the read list when the user asks
+    # for a quantity that must be assembled from multiple fields. The actual
+    # derivation happens just after the athdf read below.
+    #   BparOverBz : Bcc1 / Bcc3 (component along the flow / toroidal).
+    #                Flow is in x1 for KHI-style inputs.
+    composite = kwargs['quantity'] if kwargs['quantity'] in ('BparOverBz',) else None
+    if composite == 'BparOverBz':
+        quantities = ['Bcc1', 'Bcc3']
+    else:
+        quantities = [kwargs['quantity']]
     if kwargs['stream'] is not None:
         if kwargs['direction'] == 1:
             quantities.append(kwargs['stream'] + '2')
@@ -80,6 +88,16 @@ def main(**kwargs):
     else:
         data = athena_read.athdf(kwargs['data_file'], quantities=quantities, level=level,
                                  num_ghost=kwargs['num_ghost'])
+
+    # Derive composite quantity if requested. Mask near-zero denominator to NaN
+    # so pcolormesh renders those cells blank rather than +/- inf.
+    if composite == 'BparOverBz':
+        bpar = data['Bcc1']
+        bz = data['Bcc3']
+        eps = 1.0e-10
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(np.abs(bz) > eps, bpar / bz, np.nan)
+        data['BparOverBz'] = ratio
 
     # Check that coordinates work with user choices
     coordinates = data['Coordinates'].decode('ascii', 'replace')

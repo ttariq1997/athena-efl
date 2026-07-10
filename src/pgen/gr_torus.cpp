@@ -11,8 +11,9 @@
 // C++ headers
 #include <algorithm>  // max, min
 #include <cmath>      // abs, acos, atan2, cos, exp, hypot, log, NAN, pow, sin, sqrt
+#include <cstdint>    // uint64_t (Porth+19-style pressure white-noise hashing)
 #include <cstdlib>    // exit (needed for defs.hpp)
-#include <cstring>    // strcmp
+#include <cstring>    // strcmp, memcpy
 #include <iostream>   // cout (needed for defs.hpp), endl
 #include <sstream>    // stringstream
 #include <stdexcept>  // runtime_error (needed for defs.hpp)
@@ -77,7 +78,10 @@ Real rho_min, rho_pow, pgas_min, pgas_pow;    // background parameters
 bool prograde;                                // flag indicating disk is prograde
 Real r_edge, r_peak, l, r_peak_max, rho_max;  // torus parameters
 Real tilt;                                    // tilt angle
-Real pert_amp, pert_kr, pert_kz;              // initial perturbations parameters
+Real pert_amp, pert_kr, pert_kz;              // velocity perturbation (Athena default)
+std::string pert_type;                        // "velocity" | "pressure" | "none"
+Real pert_pgas_max;                           // pressure noise max |X_p| (Porth+19)
+std::int64_t pert_seed;                       // base seed for pressure noise
 MagneticFieldConfigs field_config;            // type of magnetic field
 Real pot_r_pow;                               // density vector potential parameters
 Real pot_rho_pow, pot_rho_cutoff;             // density vector potential parameters
@@ -171,10 +175,40 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     pot_amp = pin->GetReal("problem", "pot_amp");
   }
 
-  // Read perturbation parameters from input file
+  // Read perturbation parameters from input file.
+  //
+  // pert_type selects the perturbation scheme applied inside the torus:
+  //   "velocity" -- Athena++ default: sinusoidal velocity perturbation with
+  //                 amplitude pert_amp * sin(pert_kr*r_cyl) * cos(pert_kz*z).
+  //                 Bit-identical to the pre-2026 pgen behavior.
+  //   "pressure" -- Porth+19-style: pressure white noise p -> p*(1 + X_p) with
+  //                 X_p in [-pert_pgas_max, +pert_pgas_max] uniformly at random.
+  //                 Paper's "amplitude 4%" -> pert_pgas_max = 0.02.  Noise is
+  //                 deterministic per-cell (coordinate-hashed), so different
+  //                 MPI decompositions of the same grid give identical noise.
+  //   "none"     -- No perturbation.  MRI seeds from float roundoff (WSG16 §6).
+  pert_type = pin->GetOrAddString("problem", "pert_type", "velocity");
   pert_amp = pin->GetOrAddReal("problem", "pert_amp", 0.0);
   pert_kr = pin->GetOrAddReal("problem", "pert_kr", 0.0);
   pert_kz = pin->GetOrAddReal("problem", "pert_kz", 0.0);
+  pert_pgas_max = pin->GetOrAddReal("problem", "pert_pgas_max", 0.0);
+  pert_seed = pin->GetOrAddInteger("problem", "pert_seed", 42);
+  if (pert_type != "velocity" && pert_type != "pressure" && pert_type != "none") {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in gr_torus.cpp: unknown pert_type='" << pert_type
+        << "'.  Valid: velocity, pressure, none." << std::endl;
+    ATHENA_ERROR(msg);
+  }
+  // Guard: pert_pgas_max in [0, 1) keeps p * (1 + X_p) strictly positive.
+  // Paper's 4% (pert_pgas_max = 0.02) is well within this bound.
+  if (pert_type == "pressure"
+      && (pert_pgas_max < 0.0 || pert_pgas_max >= 1.0)) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in gr_torus.cpp: pert_pgas_max=" << pert_pgas_max
+        << " must lie in [0, 1) to keep p*(1+X_p) > 0.  "
+        << "Porth+19's 4% → pert_pgas_max = 0.02." << std::endl;
+    ATHENA_ERROR(msg);
+  }
 
   // Read flux parameters from input file
   num_flux_radii = pin->GetOrAddInteger("problem", "num_flux_radii", 0);
@@ -316,6 +350,44 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
 //     Fishbone 1977, ApJ 215 323 (F)
 //   Assumes x3 is axisymmetric direction.
 
+//----------------------------------------------------------------------
+// Coordinate-hashed uniform random draw for pressure white noise.
+//
+// Returns a uniform Real in [-1, +1) that depends deterministically on the
+// three cell-center coordinates (x1, x2, x3) and a user seed.
+//
+// Purpose: MPI-decomposition-independent MRI seeding.  Every cell in the
+// grid gets a unique X_p regardless of which rank owns it or in what order
+// the meshblocks were constructed -- restarts, MPI reruns, and OpenMP
+// reruns all produce identical noise for the same grid + seed.
+//
+// Uses the splitmix64 finalizer (Vigna 2015) applied to the double-bit
+// representation of each coordinate.  splitmix64 avalanche is well tested
+// for hashing double bit patterns and passes SmallCrush.  This is not
+// cryptographic; it's a fast deterministic PRNG mapping (x1,x2,x3,seed)
+// -> uniform[-1,+1] with excellent statistical uniformity for MRI seeding.
+namespace {
+inline std::uint64_t Splitmix64Mix(std::uint64_t h) {
+  h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+  return h ^ (h >> 31);
+}
+inline std::uint64_t HashCoordBits(Real x) {
+  double xd = static_cast<double>(x);
+  std::uint64_t bits;
+  std::memcpy(&bits, &xd, sizeof(bits));
+  return Splitmix64Mix(bits);
+}
+inline Real UniformNoiseAt(Real x1, Real x2, Real x3, std::int64_t seed) {
+  std::uint64_t h = HashCoordBits(x1) ^ HashCoordBits(x2) ^ HashCoordBits(x3);
+  h ^= static_cast<std::uint64_t>(seed);
+  h = Splitmix64Mix(h);
+  // Convert top 53 bits to double in [0, 1) (standard uint64 -> double trick).
+  double u01 = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
+  return static_cast<Real>(2.0 * u01 - 1.0);   // uniform [-1, +1)
+}
+}  // namespace
+
 void MeshBlock::ProblemGenerator(ParameterInput *pin) {
   // Prepare index bounds
   int il = is - NGHOST;
@@ -415,19 +487,39 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
           uu3 = u3 - gi(I03,i) / gi(I00,i) * u0;
         }
 
-        // Set primitive values, including cylindrically symmetric radial velocity
-        // perturbations
+        // MRI-seeding perturbation, applied only inside the torus.  Three modes:
+        //   "velocity" -- sinusoidal velocity perturbation (Athena default;
+        //                 amplitude pert_amp * sin(pert_kr*r_cyl) * cos(pert_kz*z)
+        //                 applied to u^r and u^theta).  Bit-identical to the
+        //                 pre-2026 pgen behavior for pre-existing decks.
+        //   "pressure" -- Porth+19-style: p -> p * (1 + X_p) with X_p a
+        //                 spatially uncorrelated (white) noise on [-pert_pgas_max,
+        //                 +pert_pgas_max].  Deterministic per-cell hash of the
+        //                 cell-center coordinates + pert_seed -> MPI-independent.
+        //   "none"     -- Nothing; MRI seeds from float roundoff (WSG16 §6).
         Real rr_bl = r_bl * sth_bl_t;
         Real z_bl = r_bl * cth_bl_t;
-        Real amp_rel = 0.0;
+        Real pert_uur = 0.0;
+        Real pert_uutheta = 0.0;
+        Real pgas_perturbed = pgas;
+
         if (in_torus) {
-          amp_rel = pert_amp * std::sin(pert_kr * rr_bl) * std::cos(pert_kz * z_bl);
+          if (pert_type == "velocity") {
+            Real amp_rel = pert_amp
+                * std::sin(pert_kr * rr_bl) * std::cos(pert_kz * z_bl);
+            Real amp_abs = amp_rel * uu3;
+            pert_uur = rr_bl / r_bl * amp_abs;
+            pert_uutheta = cth_bl / r_bl * amp_abs;
+          } else if (pert_type == "pressure") {
+            Real x_p = pert_pgas_max
+                * UniformNoiseAt(x1, x2, x3, pert_seed);
+            pgas_perturbed = pgas * (1.0 + x_p);
+          }
+          // "none" -> both perturbations stay at their default zero.
         }
-        Real amp_abs = amp_rel * uu3;
-        Real pert_uur = rr_bl / r_bl * amp_abs;
-        Real pert_uutheta = cth_bl / r_bl * amp_abs;
+
         phydro->w(IDN,k,j,i) = phydro->w1(IDN,k,j,i) = rho;
-        phydro->w(IPR,k,j,i) = phydro->w1(IPR,k,j,i) = pgas;
+        phydro->w(IPR,k,j,i) = phydro->w1(IPR,k,j,i) = pgas_perturbed;
         phydro->w(IVX,k,j,i) = phydro->w1(IVX,k,j,i) = uu1 + pert_uur;
         phydro->w(IVY,k,j,i) = phydro->w1(IVY,k,j,i) = uu2 + pert_uutheta;
         phydro->w(IVZ,k,j,i) = phydro->w1(IVZ,k,j,i) = uu3;

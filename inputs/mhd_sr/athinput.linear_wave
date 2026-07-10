@@ -3,21 +3,29 @@ problem = 1D linear wave
 configure = --prob=gr_linear_wave -s -b --coord=cartesian --flux=hlld
 
 <job>
-problem_id = linear_wave_mhd_rel
+problem_id = linear_wave_mhd_rel_llf_weno5z_100
 
 <output1>
 file_type   = tab
 variable    = prim
 data_format = %24.16e
-dt          = 10.0
+dt          = 2.5
+
+#<output2>
+#file_type = tab
+#variable = efl_x1
+#data_format = %24.16e
+#dt =       2.5
 
 <time>
-cfl_number = 0.8
+cfl_number = 0.25
 nlim       = -1
-tlim       = 10.0
-integrator  = vl2       # time integration algorithm
-xorder      = 2         # order of spatial reconstruction
+tlim       = 3.0
+integrator  = rk3       # time integration algorithm
+xorder      = weno5z         # order of spatial reconstruction
 ncycle_out  = 1         # interval for stdout summary info
+xorder_HO = weno5z
+
 
 <mesh>
 nx1    = 100       # number of cells in x-direction
@@ -38,13 +46,15 @@ x3max  = 0.5       # maximum z
 ix3_bc = periodic  # lower boundary
 ox3_bc = periodic  # upper boundary
 
-<meshblock>
-nx1 = 100
-nx2 = 1
-nx3 = 1
 
 <hydro>
 gamma = 1.3333333333333333  # ratio of specific heats Gamma
+efl_enable = false
+efl_cE = 1.0
+efl_cmax = 1.0
+efl_buffer_cycles = 0
+efl_debug_flux_usage = false
+efl_debug_flux_every = 0
 
 <problem>
 wave_flag     = 3       # 0/6, 1/5, 2/4 for L/R fast, Alfven, slow; 3 for entropy
