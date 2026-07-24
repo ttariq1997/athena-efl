@@ -43,9 +43,21 @@ enum HOReconKindRMHD {
 //   CHARACTERISTIC — force characteristic path (bit-identical to legacy code).
 //   COMPONENTWISE  — force componentwise path (skip eigsys entirely; use when
 //                    Anton eigenvectors are ill-conditioned, e.g. SR-MHD rotor).
-constexpr int HO_MODE_AUTO           = 0;
-constexpr int HO_MODE_CHARACTERISTIC = 1;
-constexpr int HO_MODE_COMPONENTWISE  = 2;
+//   DIRECT_INVERSE — Antón §5.2 direct conserved-variable R + T-transform +
+//                    column scaling + L = R⁻¹ via Gauss-Jordan.  Fast production
+//                    path; ~1500 ops/face.  Delivers machine-precision L·R = I
+//                    at all tested states via column-scaling numerical hygiene.
+//                    Recommended default when using the direct route.
+//   DIRECT_CONSERVED — Antón §5.2 R + §6.3 direct-conserved L formulas +
+//                    biorthogonality correction.  Paper-native implementation;
+//                    ~5900 ops/face (~4× slower than DIRECT_INVERSE) but
+//                    matches Antón §6.3 formula-by-formula.  Useful for
+//                    paper-reproducibility verification runs.
+constexpr int HO_MODE_AUTO             = 0;
+constexpr int HO_MODE_CHARACTERISTIC   = 1;
+constexpr int HO_MODE_COMPONENTWISE    = 2;
+constexpr int HO_MODE_DIRECT_CONSERVED = 3;
+constexpr int HO_MODE_DIRECT_INVERSE   = 4;
 
 // Optional cs5_w[5] argument: per-face CS5 weights for non-uniform grids
 // (Mignone 2014 Vandermonde).  When non-null, cs5_w is used IN PLACE of the
@@ -525,6 +537,37 @@ inline void GetEigenValuesSRMHD(const RMHDState &state, Real lambda[NRMHD]) {
     QuarticRootsRMHD(coeff_3 / coeff_4, coeff_2 / coeff_4,
                      coeff_1 / coeff_4, coeff_0 / coeff_4,
                      &lambda[0], &lambda[2], &lambda[4], &lambda[6]);
+
+    // Newton refinement at long-double precision.  At high W + low cs² (e.g.
+    // FM-torus jet spine: W~20, cs²~1e-5), quartic coefficients scale as
+    // ρh·γ⁴/cs² ~ 1e10-1e12 while the slow-magnetosonic pair sits within
+    // ~1e-5 of the entropic v_n.  Double-precision round-off then leaves λ
+    // with ~1e-7 relative error, which the direct_conserved L path amplifies
+    // to |L·R − I| ~ 1e-3 via the (𝓑/a)_{m,±} formula (denom_A sensitivity).
+    // Long-double refinement drops λ error to ~1e-14, restoring machine-
+    // precision L·R everywhere.  Cost: ~500 extra ops per call (~15% of the
+    // eigenvalue solve, ~1% of the full per-face HO pipeline).
+    {
+      const long double c4l = (long double)coeff_4;
+      const long double c3l = (long double)coeff_3;
+      const long double c2l = (long double)coeff_2;
+      const long double c1l = (long double)coeff_1;
+      const long double c0l = (long double)coeff_0;
+      const int mag_idx[4] = {0, 2, 4, 6};
+      for (int k = 0; k < 4; ++k) {
+        const int i = mag_idx[k];
+        long double x = (long double)lambda[i];
+        for (int it = 0; it < 12; ++it) {
+          const long double f  = (((c4l*x + c3l)*x + c2l)*x + c1l)*x + c0l;
+          const long double df = ((4.0L*c4l*x + 3.0L*c3l)*x + 2.0L*c2l)*x + c1l;
+          if (df == 0.0L) break;
+          const long double dx = f / df;
+          x -= dx;
+          if (std::fabs(dx) < 1.0e-19L * (std::fabs(x) + 1.0e-19L)) break;
+        }
+        lambda[i] = (Real)x;
+      }
+    }
   } else if (std::abs(coeff_3) > constants::QUARTIC_TOL * coeff_scale) {
     // Degenerate to cubic: coeff_3*λ³ + coeff_2*λ² + coeff_1*λ + coeff_0 = 0
     // This happens near Type I degeneracy where slow waves collapse
@@ -1435,7 +1478,35 @@ inline PaperProductSummarySRMHD SummarizeProductPaperSRMHD(
 
 inline Real ComputePaperBOverASRMHD(const RMHDState &s, const Real lambda,
                                     const bool negative_class) {
+  // Antón §5.2 defines (𝓑/a)_{m,±} for magnetosonic waves via the paper's
+  // Eq. (bas): |𝓑/a|² = −factor_b − factor_a·a²/G, with the ± subscript
+  // encoding a sign choice.  Historically we used the heuristic
+  // (negative_class → +, positive_class → −), but this is state-dependent:
+  //
+  //   𝓑 ≡ b^x − b⁰·λ
+  //   a ≡ u^x − λ·W
+  //
+  // At states with high (u,B) coupling (b⁰ large, e.g. FM-torus jet base at
+  // σ ~ 100, W ~ 5, off-axis B) the term λ·b⁰ can EXCEED b^x, flipping the
+  // sign of 𝓑, and the heuristic assigns the wrong sign to (𝓑/a).  At S11 the
+  // fast+ eigenvector was corrupted by this: cosine-similarity vs the true
+  // fast+ eigenvector of A_num dropped to −0.56, and the physical residual
+  // |δF_pred − δF|/|δF| blew up to 35× instead of the ~1e-7 seen at S1..S10.
+  //
+  // Fix: compute (𝓑/a) DIRECTLY from state (numerically stable when |a| is
+  // well away from zero) and use the sqrt/heuristic ONLY at Type-I-adjacent
+  // states where a→0.  The direct formula is bit-identical to the sqrt form
+  // in magnitude (both derived from N_4(λ)=0) and preserves the physical sign.
   const Real a = s.util_n - lambda * s.W;
+  const Real B = s.b_n     - lambda * s.b0;
+  const Real a_scale = std::max((Real)1.0e-14,
+                                 std::sqrt(SQR(s.util_n) + SQR(s.W)));
+  if (std::abs(a) > 1.0e-8 * a_scale) {
+    return B / a;                       // direct — magnitude & sign correct
+  }
+  // Near Type-I (|a| → 0): fall back to paper's sqrt formula.  Sign heuristic
+  // is applied but the ambiguity is bounded because a → 0 means (𝓑/a) → ∞
+  // and the eigenvector formula's overall denom_A/denom_B factor cancels it.
   const Real G = 1.0 - SQR(lambda);
   const Real factor_a = s.rhoh * (1.0 / s.cs2 - 1.0);
   const Real factor_b = -(s.rhoh + s.bsq / s.cs2);

@@ -12,6 +12,7 @@
 
 #include "../../hydro.hpp"
 #include "../../CharacteristicFieldsRMHD.hpp"
+#include "../../CharacteristicFieldsRMHDDirect.hpp"    // Antón §5 direct-conserved route
 #include "../../../athena.hpp"
 #include "../../../athena_arrays.hpp"
 #include "../../../coordinates/coordinates.hpp"
@@ -315,7 +316,22 @@ void RusanovFluxDir(Hydro *ph,
 #if EFL_DEBUG
           ++ph->ho_eig_calls_;
 #endif
-          eig_ok = GetEigenVectorSRMHD(avg_state, lambda_avg, L_eig, R_eig);
+          // Route the eigenvector build based on recon_mode:
+          //   DIRECT_INVERSE   — Antón §5.2 R + T-transform + column scaling
+          //                      + L = R⁻¹ via Gauss-Jordan (fast production path)
+          //   DIRECT_CONSERVED — Antón §5.2 R + §6.3 direct-conserved L +
+          //                      biorthogonality correction (paper-native, ~4×
+          //                      slower; useful for paper-reproducibility runs)
+          //   other modes      — covariant-first route from base header.
+          if (recon_mode == HO_MODE_DIRECT_INVERSE) {
+            eig_ok = direct::GetEigenVectorDirectInverseSRMHD(
+                avg_state, lambda_avg, L_eig, R_eig);
+          } else if (recon_mode == HO_MODE_DIRECT_CONSERVED) {
+            eig_ok = direct::GetEigenVectorDirectSRMHD(
+                avg_state, lambda_avg, L_eig, R_eig);
+          } else {
+            eig_ok = GetEigenVectorSRMHD(avg_state, lambda_avg, L_eig, R_eig);
+          }
         }
 
         // Track statistics and handle eigensystem failure
@@ -410,7 +426,10 @@ void RusanovFluxDir(Hydro *ph,
           // characteristic projection.  For AUTO mode this catches Anton
           // ill-conditioning without the LO diffusion penalty.
 #if EFL_DEBUG
-          if (recon_mode == HO_MODE_AUTO && !skip_eigsys) {
+          if ((recon_mode == HO_MODE_AUTO
+               || recon_mode == HO_MODE_DIRECT_CONSERVED
+               || recon_mode == HO_MODE_DIRECT_INVERSE)
+              && !skip_eigsys) {
             ++ph->ho_hard_fail_;
             ++ph->ho_tier1_reject_;
           }

@@ -107,10 +107,15 @@ Hydro::Hydro(MeshBlock *pmb, ParameterInput *pin) :
   ho_b2_stencil_min_ = pin->GetOrAddReal("hydro", "ho_b2_stencil_min", 0.0);
 
   // HO reconstruction mode selector.  See hydro.hpp comment for semantics.
-  //   auto           — Anton characteristic with fall-through to componentwise
-  //                    when the strict L·R check rejects the eigsys result.
-  //   characteristic — force Anton characteristic (bit-identical legacy).
-  //   componentwise  — force components split (Guercilena+17 §2.2 Eq. 7).
+  //   auto             — Anton characteristic with fall-through to componentwise
+  //                      when the strict L·R check rejects the eigsys result.
+  //   characteristic   — force Anton characteristic (bit-identical legacy).
+  //   componentwise    — force components split (Guercilena+17 §2.2 Eq. 7).
+  //   direct_inverse   — Antón §5.2 R + T-transform + column scaling + L = R⁻¹
+  //                      via Gauss-Jordan (~1500 ops/face; fast production path).
+  //   direct_conserved — Antón §5.2 R + §6.3 direct-conserved L formulas +
+  //                      biorthogonality correction (~5900 ops/face, ~4× slower
+  //                      than direct_inverse; paper-native verification path).
   const std::string ho_mode_str =
       pin->GetOrAddString("hydro", "ho_recon_mode", "auto");
   if (ho_mode_str == "auto") {
@@ -119,11 +124,17 @@ Hydro::Hydro(MeshBlock *pmb, ParameterInput *pin) :
     ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_CHARACTERISTIC;
   } else if (ho_mode_str == "componentwise") {
     ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_COMPONENTWISE;
+  } else if (ho_mode_str == "direct_conserved") {
+    ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_DIRECT_CONSERVED;
+  } else if (ho_mode_str == "direct_inverse") {
+    ho_recon_mode_ = characterisiticfields::rmhd::HO_MODE_DIRECT_INVERSE;
   } else {
     std::stringstream msg;
     msg << "### FATAL ERROR in Hydro constructor" << std::endl
         << "Unsupported hydro/ho_recon_mode='" << ho_mode_str
-        << "'. Valid: auto, characteristic, componentwise." << std::endl;
+        << "'. Valid: auto, characteristic, componentwise, "
+        << "direct_inverse, direct_conserved."
+        << std::endl;
     ATHENA_ERROR(msg);
   }
 
